@@ -1,0 +1,43 @@
+# Direct dependencies for langchain_ai_assistant
+# Python 3.13.2
+#
+# Install:  pip install -r requirements.txt
+#
+# Only packages your code actually imports are listed, pinned to the versions
+# verified working in .venv. Transitive dependencies (langchain-classic,
+# langgraph-sdk, onnxruntime, pydantic-core, ...) are resolved by pip.
+#
+# Env vars go in .env and are NOT listed here:
+#   POSTGRES_URI, OPENROUTER_API_KEY, GOOGLE_API_KEY, OPENROUTER_MODEL
+
+# --- LLM provider ---
+langchain-openrouter==0.2.9   # ChatOpenRouter
+openrouter==0.11.46           # ChatOpenRouter error classes (429/5xx retry logic)
+
+# --- LangChain core + RAG ---
+langchain-core==1.6.3
+langchain-community==0.4.2    # document loaders
+langchain-text-splitters==1.1.2
+
+# --- LangGraph agent ---
+langgraph==1.2.11
+langgraph-prebuilt==1.1.0     # langgraph.prebuilt.ToolNode
+langgraph-checkpoint==4.2.0
+langgraph-checkpoint-postgres==3.1.2   # langgraph.checkpoint.postgres.PostgresSaver
+
+# --- PostgreSQL (checkpoints + long-term memory) ---
+# [binary] ships prebuilt wheels, so no pg_config/compiler needed on Windows.
+psycopg[binary]==3.3.6
+psycopg-pool==3.3.3
+
+# --- Vector store ---
+chromadb==1.5.9
+langchain-chroma==1.1.0
+
+# --- API ---
+fastapi==0.142.2
+pydantic==2.12.5
+uvicorn==0.53.0
+
+# --- Config ---
+python-dotenv==1.2.3
