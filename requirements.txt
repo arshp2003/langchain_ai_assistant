@@ -29,6 +29,13 @@ langgraph-checkpoint-postgres==3.1.2   # langgraph.checkpoint.postgres.PostgresS
 # [binary] ships prebuilt wheels, so no pg_config/compiler needed on Windows.
 psycopg[binary]==3.3.6
 psycopg-pool==3.3.3
+pgvector==0.5.1                 # pgvector.psycopg.register_vector
+
+# --- Semantic memory embeddings ---
+numpy==2.5.3
+sentence-transformers==6.1.0    # all-MiniLM-L6-v2 (384-dim) in memory.py
+torch==2.14.1+cpu               # install from https://download.pytorch.org/whl/cpu
+transformers==5.19.0
 
 # --- Vector store ---
 chromadb==1.5.9

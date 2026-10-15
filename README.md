@@ -353,6 +353,40 @@ Get user profile information.
 }
 ```
 
+#### GET `/threads/{user_id}`
+Get all conversation threads for a user (like ChatGPT's conversation history).
+
+**Query Parameters**:
+- `limit` (optional): Maximum number of threads to return (default: 50)
+
+**Response**:
+```json
+{
+  "user_id": "user-123",
+  "count": 3,
+  "threads": [
+    {
+      "thread_id": "run-9e7a8ecc68584376b0f97e9572f31bc8",
+      "title": "What is 10 + 20?",
+      "created_at": "2026-10-08T23:22:05.793557+05:30",
+      "last_active": "2026-10-08T23:22:05.793557+05:30"
+    }
+  ]
+}
+```
+
+#### DELETE `/threads/{user_id}/{thread_id}`
+Delete a thread mapping for a user.
+
+**Response**:
+```json
+{
+  "status": "deleted",
+  "user_id": "user-123",
+  "thread_id": "run-9e7a8ecc68584376b0f97e9572f31bc8"
+}
+```
+
 ### Utility Endpoints
 
 #### GET `/health`
@@ -401,6 +435,40 @@ Get the agent graph structure.
 ```
 
 ## Memory System
+
+### Conversation History (ChatGPT-like)
+
+The system now supports persistent conversation history, similar to ChatGPT:
+
+1. **Automatic Thread Registration**: Every conversation is automatically registered with the user's thread list
+2. **Thread Listing**: Use `GET /threads/{user_id}` to list all conversations for a user
+3. **Resume Conversations**: Load a previous thread and continue the conversation
+4. **Thread Metadata**: Each thread has a title (first 50 chars of the question), created_at, and last_active timestamp
+
+**Example Flow**:
+```python
+# Day 1: Have a conversation
+result = run_agent(
+    "I'm learning LangGraph",
+    thread_id="my-chat-123",
+    user_id="arsh"
+)
+# Thread is automatically registered
+
+# Day 2: List all conversations
+threads = get_user_threads("arsh")
+# Returns: [{"thread_id": "my-chat-123", "title": "I'm learning LangGraph", ...}]
+
+# Continue the conversation
+result = run_agent(
+    "Can you explain checkpoints?",
+    thread_id="my-chat-123",  # Same thread_id!
+    user_id="arsh"
+)
+# Agent sees the full history and continues naturally
+```
+
+### Long-Term Memory
 
 ### How It Works
 

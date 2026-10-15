@@ -31,9 +31,10 @@ from psycopg_pool import ConnectionPool
 
 from memory import (
     format_memories_for_prompt,
-    get_user_memories,
     init_memory_tables,
+    register_thread,
     save_memory,
+    semantic_search,
 )
 
 
@@ -467,6 +468,129 @@ def get_agent():
     return _agent
 
 
+_agent_hitl = None
+
+
+def get_agent_hitl():
+    """Compiled graph that pauses before tool execution and memory extraction.
+
+    Uses interrupt_before so the graph saves its checkpoint and waits for
+    human approval before running those nodes. The state at the interrupt
+    point shows exactly what the agent plans to do next.
+    """
+    global _agent_hitl
+    if _agent_hitl is None:
+        _agent_hitl = builder.compile(
+            checkpointer=get_checkpointer(),
+            interrupt_before=["tools", "extract_memory"],
+        )
+    return _agent_hitl
+
+
+def get_pending_approval(thread_id: str) -> dict:
+    """Inspect what the graph wants to do next while paused at an interrupt.
+
+    Returns the pending node name and a human-readable description of the
+    action awaiting approval, so the user can decide to approve or reject.
+    """
+    config = _thread_config(thread_id)
+    snapshot = get_agent_hitl().get_state(config)
+
+    if not snapshot.next:
+        return {"status": "no_pending_action", "thread_id": thread_id}
+
+    pending_node = snapshot.next[0]
+    values = snapshot.values
+    last_messages = values.get("messages", [])
+    last_message = last_messages[-1] if last_messages else None
+
+    detail = {}
+    if pending_node == "tools" and last_message and isinstance(last_message, AIMessage):
+        tool_calls = getattr(last_message, "tool_calls", [])
+        detail = {
+            "pending_node": "tools",
+            "action": "execute_tools",
+            "tool_calls": [
+                {"name": tc["name"], "args": tc["args"]}
+                for tc in tool_calls
+            ],
+        }
+    elif pending_node == "extract_memory":
+        detail = {
+            "pending_node": "extract_memory",
+            "action": "extract_and_save_memories",
+            "message": "Agent will analyze the conversation and save personal info/preferences to long-term memory.",
+        }
+    else:
+        detail = {
+            "pending_node": pending_node,
+            "action": pending_node,
+        }
+
+    detail["thread_id"] = thread_id
+    detail["status"] = "awaiting_approval"
+    return detail
+
+
+def resume_with_approval(thread_id: str, approved: bool, feedback: str = "") -> dict:
+    """Resume a paused graph after human review.
+
+    If approved, the pending node runs normally.
+    If rejected, a human feedback message is injected so the agent can
+    adjust its behaviour, and the graph continues from there.
+    """
+    config = _thread_config(thread_id)
+    graph = get_agent_hitl()
+    snapshot = graph.get_state(config)
+
+    if not snapshot.next:
+        return {"status": "nothing_to_resume", "thread_id": thread_id}
+
+    pending_node = snapshot.next[0]
+
+    if not approved:
+        rejection_msg = f"Human reviewer rejected the '{pending_node}' step."
+        if feedback:
+            rejection_msg += f" Feedback: {feedback}"
+
+        if pending_node == "tools":
+            values = snapshot.values
+            last_message = values["messages"][-1]
+            tool_call_ids = [
+                tc["id"] for tc in getattr(last_message, "tool_calls", [])
+            ]
+            from langchain_core.messages import ToolMessage
+            rejection_messages = [
+                ToolMessage(
+                    content=rejection_msg,
+                    tool_call_id=tc_id,
+                )
+                for tc_id in tool_call_ids
+            ]
+            graph.update_state(config, {"messages": rejection_messages})
+        else:
+            graph.update_state(
+                config,
+                {"messages": [HumanMessage(content=rejection_msg)]},
+            )
+
+    trace = []
+    answer = ""
+    for item in _events_from(graph.stream(None, config, stream_mode="updates")):
+        trace.append(item)
+        if item["event"] == "answer":
+            answer = item["content"]
+
+    return {
+        "status": "resumed",
+        "approved": approved,
+        "thread_id": thread_id,
+        "answer": answer,
+        "trace": trace,
+        "still_pending": bool(graph.get_state(config).next),
+    }
+
+
 # -----------------------------
 # 8. Run graph as event stream (checkpointed + resumable)
 # -----------------------------
@@ -487,6 +611,9 @@ def _events_from(stream):
         for node, update in step.items():
 
             if update is None:
+                continue
+
+            if not isinstance(update, dict):
                 continue
 
             for message in update.get("messages", []):
@@ -529,10 +656,10 @@ def stream_agent(question: str, thread_id: str | None = None, user_id: str | Non
     user_memories = ""
     if user_id:
         try:
-            memories = get_user_memories(user_id)
+            memories = semantic_search(user_id, question, top_k=3)
             user_memories = format_memories_for_prompt(memories)
         except Exception as exc:
-            print(f"[memory] failed to load memories: {exc}")
+            print(f"[memory] failed to search memories: {exc}")
 
     messages = [HumanMessage(content=question)]
     if user_memories:
@@ -582,10 +709,10 @@ def run_agent(question: str, thread_id: str | None = None, user_id: str | None =
     user_memories = ""
     if user_id:
         try:
-            memories = get_user_memories(user_id)
+            memories = semantic_search(user_id, question, top_k=3)
             user_memories = format_memories_for_prompt(memories)
         except Exception as exc:
-            print(f"[memory] failed to load memories: {exc}")
+            print(f"[memory] failed to search memories: {exc}")
 
     messages = [HumanMessage(content=question)]
     if user_memories:
@@ -604,6 +731,13 @@ def run_agent(question: str, thread_id: str | None = None, user_id: str | None =
         trace.append(item)
         if item["event"] == "answer":
             answer = item["content"]
+
+    if user_id:
+        try:
+            title = question[:50] if len(question) > 50 else question
+            register_thread(user_id, resolved_thread_id, title)
+        except Exception as exc:
+            print(f"[memory] failed to register thread: {exc}")
 
     return {
         "answer": answer,
@@ -643,10 +777,10 @@ def run_agent_with_recovery(
     user_memories = ""
     if user_id:
         try:
-            memories = get_user_memories(user_id)
+            memories = semantic_search(user_id, question, top_k=3)
             user_memories = format_memories_for_prompt(memories)
         except Exception as exc:
-            print(f"[memory] failed to load memories: {exc}")
+            print(f"[memory] failed to search memories: {exc}")
 
     messages = [HumanMessage(content=question)]
     if user_memories:
@@ -684,5 +818,70 @@ def run_agent_with_recovery(
         "trace": trace,
         "thread_id": resolved_thread_id,
         "resumed": resumed,
+        "llm": _stats_delta(before),
+    }
+
+
+def run_agent_hitl(
+    question: str,
+    thread_id: str | None = None,
+    user_id: str | None = None,
+) -> dict:
+    """Start a question using the human-in-the-loop graph.
+
+    Runs until the first interrupt point (tool execution or memory extraction),
+    then pauses and returns the pending action for human review. The caller
+    uses get_pending_approval() to inspect and resume_with_approval() to
+    approve or reject.
+    """
+    before = get_llm_stats()
+    config = _thread_config(thread_id)
+    resolved_thread_id = config["configurable"]["thread_id"]
+
+    user_memories = ""
+    if user_id:
+        try:
+            memories = semantic_search(user_id, question, top_k=3)
+            user_memories = format_memories_for_prompt(memories)
+        except Exception as exc:
+            print(f"[memory] failed to search memories: {exc}")
+
+    messages = [HumanMessage(content=question)]
+    if user_memories:
+        system_msg = f"System: {user_memories}\n\n"
+        messages.insert(0, HumanMessage(content=system_msg))
+
+    inputs: AgentState = {
+        "messages": messages,
+        "attempts": 0,
+        "validation_error": "",
+        "user_id": user_id or "",
+        "user_memories": user_memories,
+    }
+
+    trace = []
+    answer = ""
+    graph = get_agent_hitl()
+
+    for item in _events_from(graph.stream(inputs, config, stream_mode="updates")):
+        trace.append(item)
+        if item["event"] == "answer":
+            answer = item["content"]
+
+    snapshot = graph.get_state(config)
+    pending = get_pending_approval(resolved_thread_id)
+
+    if user_id:
+        try:
+            title = question[:50] if len(question) > 50 else question
+            register_thread(user_id, resolved_thread_id, title)
+        except Exception as exc:
+            print(f"[memory] failed to register thread: {exc}")
+
+    return {
+        "answer": answer,
+        "trace": trace,
+        "thread_id": resolved_thread_id,
+        "pending_approval": pending,
         "llm": _stats_delta(before),
     }

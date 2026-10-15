@@ -9,15 +9,20 @@ from agent_graph import (
     MODEL_NAME,
     builder,
     get_llm_stats,
+    get_pending_approval,
     reset_llm_stats,
+    resume_with_approval,
     run_agent,
+    run_agent_hitl,
     stream_agent,
 )
 from memory import (
     delete_all_user_memories,
     delete_memory,
+    delete_thread,
     get_user_memories,
     get_user_profile,
+    get_user_threads,
     save_memory,
 )
 
@@ -165,6 +170,28 @@ def user_profile(user_id: str) -> dict:
     return profile
 
 
+@app.get("/threads/{user_id}")
+def list_threads(user_id: str, limit: int = 50) -> dict:
+    """Get all conversation threads for a user."""
+    threads = get_user_threads(user_id, limit)
+    return {
+        "user_id": user_id,
+        "count": len(threads),
+        "threads": threads,
+    }
+
+
+@app.delete("/threads/{user_id}/{thread_id}")
+def remove_thread(user_id: str, thread_id: str) -> dict:
+    """Delete a thread mapping for a user."""
+    deleted = delete_thread(user_id, thread_id)
+    return {
+        "status": "deleted" if deleted else "not_found",
+        "user_id": user_id,
+        "thread_id": thread_id,
+    }
+
+
 @app.get("/graph")
 def graph() -> dict:
     return {
@@ -183,6 +210,34 @@ def graph() -> dict:
             for branch in branches.values()
         ],
     }
+
+
+class ApprovalRequest(BaseModel):
+    approved: bool = Field(..., examples=[True])
+    feedback: str = Field(
+        default="",
+        description="Optional feedback when rejecting, e.g. 'use a different approach'",
+    )
+
+
+@app.post("/chat/hitl")
+def chat_hitl(request: ChatRequest) -> dict:
+    """Start a human-in-the-loop run. Pauses before tool calls and memory
+    extraction so the user can review and approve/reject each step."""
+    result = run_agent_hitl(request.question, user_id=request.user_id)
+    return result
+
+
+@app.get("/approval/{thread_id}")
+def check_approval(thread_id: str) -> dict:
+    """See what action the graph is waiting to execute next."""
+    return get_pending_approval(thread_id)
+
+
+@app.post("/approval/{thread_id}")
+def handle_approval(thread_id: str, request: ApprovalRequest) -> dict:
+    """Approve or reject the pending action and resume the graph."""
+    return resume_with_approval(thread_id, request.approved, request.feedback)
 
 
 if __name__ == "__main__":
