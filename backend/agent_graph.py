@@ -3,11 +3,12 @@ import random
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Annotated, TypedDict
 
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.tools import tool
@@ -36,10 +37,16 @@ from memory import (
     save_memory,
     semantic_search,
 )
+from tool_policies import should_require_approval, get_pending_tool_calls_requiring_approval
 
 
 # Configurable via .env (OPENROUTER_MODEL) so you can swap slugs without editing code.
-MODEL_NAME = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
+# Fallback chain: if primary model hits rate limit, try these in order.
+MODEL_NAME = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
+FALLBACK_MODELS = [
+    "meta-llama/llama-3.2-3b-instruct:free",
+    "qwen/qwen-2-7b-instruct:free",
+]
 
 MAX_ATTEMPTS = 2
 
@@ -66,10 +73,177 @@ def divide_numbers(a: int, b: int) -> float:
     return a / b
 
 
+@tool
+def search_documents(query: str, filenames: list[str] = None) -> str:
+    """Search through uploaded documents to find relevant information.
+    
+    Use this tool when the user asks about content from their uploaded documents,
+    notes, PDFs, or any knowledge base content. Returns relevant document chunks.
+    
+    Args:
+        query: The search query to find relevant document sections
+        filenames: Optional list of specific filenames to search in. If provided,
+                   only searches within these files. If None, searches all documents.
+        
+    Returns:
+        Relevant document chunks or a message if no documents are found
+    """
+    try:
+        from langchain_chroma import Chroma
+        from embeddings import LocalEmbeddings
+        
+        embedding_function = LocalEmbeddings()
+        
+        vector_store = Chroma(
+            collection_name="langchain_notes",
+            embedding_function=embedding_function,
+            persist_directory=str(Path(__file__).resolve().parent / "chroma_db")
+        )
+        
+        retriever = vector_store.as_retriever(search_kwargs={"k": 5})
+        docs = retriever.invoke(query)
+        
+        if not docs:
+            return "No relevant documents found in the knowledge base."
+        
+        if filenames:
+            docs = [d for d in docs if d.metadata.get("source") in filenames]
+            if not docs:
+                return f"No relevant content found in the attached files: {', '.join(filenames)}"
+        
+        result = []
+        for i, doc in enumerate(docs[:3], 1):
+            source = doc.metadata.get("source", "Unknown")
+            result.append(f"[Document {i} - {source}]\n{doc.page_content}")
+        
+        return "\n\n---\n\n".join(result)
+        
+    except Exception as e:
+        return f"Error searching documents: {str(e)}"
+
+
+@tool
+def delete_document(filename: str) -> str:
+    """Delete an uploaded document and its vector embeddings.
+    
+    WARNING: This operation is irreversible. The file and its embeddings
+    will be permanently removed.
+    
+    Args:
+        filename: The exact filename of the document to delete (e.g., "report.pdf")
+        
+    Returns:
+        Confirmation message or error
+    """
+    from pathlib import Path
+    
+    documents_dir = Path(__file__).resolve().parent / "data" / "documents"
+    file_path = documents_dir / filename
+    
+    if not file_path.exists():
+        return f"Document not found: {filename}"
+    
+    try:
+        file_path.unlink()
+        
+        # Also remove from ChromaDB
+        try:
+            from langchain_chroma import Chroma
+            from embeddings import LocalEmbeddings
+            vector_store = Chroma(
+                collection_name="langchain_notes",
+                embedding_function=LocalEmbeddings(),
+                persist_directory=str(Path(__file__).resolve().parent / "chroma_db")
+            )
+            vector_store._collection.delete(where={"source": filename})
+        except Exception as e:
+            print(f"[delete] Warning: could not remove vectors: {e}")
+        
+        return f"Successfully deleted document: {filename}"
+    except Exception as e:
+        return f"Error deleting document: {str(e)}"
+
+
+@tool
+def delete_memory(memory_id: str, user_id: str) -> str:
+    """Delete a specific memory from long-term storage.
+    
+    WARNING: This operation is irreversible. The memory will be permanently removed.
+    
+    Args:
+        memory_id: The UUID of the memory to delete
+        user_id: The user ID who owns this memory
+        
+    Returns:
+        Confirmation message or error
+    """
+    from memory import delete_memory as _delete_memory
+    
+    try:
+        deleted = _delete_memory(user_id, memory_id)
+        if deleted:
+            return f"Successfully deleted memory: {memory_id}"
+        return f"Memory not found: {memory_id}"
+    except Exception as e:
+        return f"Error deleting memory: {str(e)}"
+
+
+@tool
+def list_documents() -> str:
+    """List all uploaded documents.
+    
+    Returns:
+        A formatted list of documents with their names and types
+    """
+    from pathlib import Path
+    
+    documents_dir = Path(__file__).resolve().parent / "data" / "documents"
+    if not documents_dir.exists():
+        return "No documents uploaded yet."
+    
+    docs = []
+    for f in documents_dir.iterdir():
+        if f.is_file():
+            docs.append(f"- {f.name} ({f.suffix[1:].upper()})")
+    
+    if not docs:
+        return "No documents uploaded yet."
+    
+    return "Uploaded documents:\n" + "\n".join(sorted(docs))
+
+
+@tool
+def list_memories(user_id: str) -> str:
+    """List all memories for a user.
+    
+    Args:
+        user_id: The user ID to list memories for
+        
+    Returns:
+        A formatted list of memories with their IDs, keys, and values
+    """
+    from memory import get_user_memories
+    
+    memories = get_user_memories(user_id)
+    if not memories:
+        return f"No memories found for user: {user_id}"
+    
+    lines = [f"Memories for {user_id}:"]
+    for m in memories:
+        lines.append(f"- [{m['memory_id'][:8]}...] {m['key']}: {m['value']} ({m['category']})")
+    
+    return "\n".join(lines)
+
+
 tools = [
     add_numbers,
     multiply_numbers,
     divide_numbers,
+    search_documents,
+    list_documents,
+    list_memories,
+    delete_document,
+    delete_memory,
 ]
 
 
@@ -77,11 +251,32 @@ tools = [
 # 2. Create models
 # -----------------------------
 
-model = ChatOpenRouter(
-    model=MODEL_NAME
-)
+# Track which model is currently active (for fallback chain)
+_current_model_index = 0
+_all_models = [MODEL_NAME] + FALLBACK_MODELS
 
+def _create_model(model_name: str):
+    """Create a ChatOpenRouter instance for the given model."""
+    return ChatOpenRouter(model=model_name)
+
+model = _create_model(MODEL_NAME)
 model_with_tools = model.bind_tools(tools)
+
+def _switch_to_next_model():
+    """Switch to the next model in the fallback chain. Returns (new_model, new_model_with_tools, switched)."""
+    global _current_model_index, model, model_with_tools
+    
+    if _current_model_index >= len(_all_models) - 1:
+        # No more fallbacks available
+        return model, model_with_tools, False
+    
+    _current_model_index += 1
+    new_model_name = _all_models[_current_model_index]
+    print(f"[fallback] Switching from {_all_models[_current_model_index - 1]} to {new_model_name}")
+    
+    model = _create_model(new_model_name)
+    model_with_tools = model.bind_tools(tools)
+    return model, model_with_tools, True
 
 
 # -----------------------------
@@ -94,6 +289,8 @@ class AgentState(TypedDict):
     validation_error: str
     user_id: str
     user_memories: str
+    needs_approval: bool
+    pending_tool_calls: list[dict]
 
 
 # -----------------------------
@@ -249,7 +446,7 @@ Only extract information that is:
 
 Return ONLY the JSON array, no other text."""
 
-    response = invoke_model(model, [HumanMessage(content=extraction_prompt)])
+    response, _ = invoke_model(model, [HumanMessage(content=extraction_prompt)])
 
     try:
         import json
@@ -301,26 +498,55 @@ def save_extracted_memories(user_id: str, memories: list[dict]) -> int:
 
 
 def invoke_model(runnable, messages):
-    """Call a model, retrying transient OpenRouter errors with backoff + jitter."""
-    slug = _model_slug(runnable)
-    delay = RETRY_BASE_DELAY
-    for attempt in range(1, MAX_RETRIES + 1):
-        _record(requests=1, slug=slug)
-        try:
-            response = runnable.invoke(messages)
-            _record(usage=getattr(response, "usage_metadata", None))
-            return response
-        except RETRYABLE_ERRORS as exc:
-            _record(failures=1)
-            if attempt == MAX_RETRIES:
-                raise
-            wait = min(delay, RETRY_MAX_DELAY) + random.uniform(0, 1)
-            print(
-                f"[retry] {type(exc).__name__} on attempt {attempt}/{MAX_RETRIES}; "
-                f"waiting {wait:.1f}s before retry"
-            )
-            time.sleep(wait)
-            delay *= 2
+    """Call a model, retrying transient OpenRouter errors with backoff + jitter.
+
+    If all retries exhaust on the current model due to rate limit, switches to
+    the next fallback model (if available) and retries from scratch.
+    Returns (response, switched_model_name_or_None).
+    """
+    global model_with_tools
+
+    switched_from = None
+    models_to_try = [_current_model_index]
+
+    # Build list of model indices to try (current + fallbacks)
+    for idx in range(_current_model_index + 1, len(_all_models)):
+        models_to_try.append(idx)
+
+    for model_idx_pos, model_idx in enumerate(models_to_try):
+        # If we need a different model than the current one, switch
+        if model_idx != _current_model_index:
+            switched_from = _all_models[_current_model_index]
+            _switch_to_next_model()
+            runnable = model_with_tools
+            print(f"[fallback] Rate limit exceeded on {switched_from}, shifted to {_all_models[_current_model_index]}")
+
+        slug = _model_slug(runnable)
+        delay = RETRY_BASE_DELAY
+        for attempt in range(1, MAX_RETRIES + 1):
+            _record(requests=1, slug=slug)
+            try:
+                response = runnable.invoke(messages)
+                _record(usage=getattr(response, "usage_metadata", None))
+                return response, switched_from
+            except RETRYABLE_ERRORS as exc:
+                _record(failures=1)
+                is_rate_limit = isinstance(exc, TooManyRequestsResponseError)
+                if attempt == MAX_RETRIES:
+                    if is_rate_limit and model_idx_pos < len(models_to_try) - 1:
+                        # Exhausted retries on this model due to rate limit — try next fallback
+                        break
+                    raise
+                wait = min(delay, RETRY_MAX_DELAY) + random.uniform(0, 1)
+                print(
+                    f"[retry] {type(exc).__name__} on attempt {attempt}/{MAX_RETRIES}; "
+                    f"waiting {wait:.1f}s before retry"
+                )
+                time.sleep(wait)
+                delay *= 2
+
+    # Should not reach here, but just in case
+    raise RuntimeError("All models exhausted")
 
 
 # -----------------------------
@@ -328,8 +554,16 @@ def invoke_model(runnable, messages):
 # -----------------------------
 
 def agent_node(state: AgentState) -> dict:
-    response = invoke_model(model_with_tools, state["messages"])
-    return {"messages": [response]}
+    response, switched_from = invoke_model(model_with_tools, state["messages"])
+    messages = []
+    if switched_from:
+        # Notify the user that we switched models due to rate limit
+        switch_msg = AIMessage(
+            content=f"Note: The model '{switched_from}' exceeded its rate limit. Switched to '{_all_models[_current_model_index]}' to continue.",
+        )
+        messages.append(switch_msg)
+    messages.append(response)
+    return {"messages": messages}
 
 
 def validate_answer_node(state: AgentState) -> dict:
@@ -343,7 +577,7 @@ def refine_node(state: AgentState) -> dict:
         "Give a corrected, self-contained final answer. "
         "Do not ask for more information."
     )
-    response = invoke_model(
+    response, _ = invoke_model(
         model, [*state["messages"], HumanMessage(content=prompt)]
     )
     return {
@@ -358,7 +592,7 @@ def fallback_node(state: AgentState) -> dict:
         "Answer the question directly in one short sentence. "
         "Do not ask questions and do not refuse."
     )
-    response = invoke_model(
+    response, _ = invoke_model(
         model, [*state["messages"], HumanMessage(content=prompt)]
     )
     return {"messages": [response], "validation_error": ""}
@@ -368,20 +602,47 @@ def extract_memory_node(state: AgentState) -> dict:
     """Extract and save user memories from the conversation."""
     user_id = state.get("user_id")
     if not user_id:
-        return {}
+        return {"memory_count": 0}
 
     try:
         memories = extract_memories_from_conversation(state["messages"])
         if memories:
             count = save_extracted_memories(user_id, memories)
             print(f"[memory] extracted and saved {count} memories for user {user_id}")
+            return {"memory_count": count}
     except Exception as exc:
         print(f"[memory] extraction failed: {exc}")
 
-    return {}
+    return {"memory_count": 0}
 
 
 tool_node = ToolNode(tools)
+
+
+def check_tool_approval_node(state: AgentState) -> dict:
+    """
+    Check if pending tool calls require human approval.
+    
+    If all tools are low-risk, auto-execute them.
+    If any tool is high-risk, interrupt for human approval.
+    """
+    last_message = state["messages"][-1]
+    
+    if not (isinstance(last_message, AIMessage) and last_message.tool_calls):
+        # No tool calls, continue normally
+        return {"needs_approval": False}
+    
+    tool_calls = last_message.tool_calls
+    requires_approval = get_pending_tool_calls_requiring_approval(tool_calls)
+    
+    if requires_approval:
+        # High-risk tools found - need human approval
+        print(f"[approval] {len(requires_approval)} tool(s) require human approval")
+        return {"needs_approval": True, "pending_tool_calls": requires_approval}
+    else:
+        # All tools are low-risk - auto-approve
+        print(f"[approval] All {len(tool_calls)} tool(s) auto-approved (low risk)")
+        return {"needs_approval": False}
 
 
 # -----------------------------
@@ -389,10 +650,18 @@ tool_node = ToolNode(tools)
 # -----------------------------
 
 def route_after_agent(state: AgentState) -> str:
+    """Route to tool approval check if there are tool calls."""
     last_message = state["messages"][-1]
     if isinstance(last_message, AIMessage) and last_message.tool_calls:
-        return "tools"
+        return "check_tool_approval"
     return "validate_answer"
+
+
+def route_after_approval_check(state: AgentState) -> str:
+    """Route based on whether tools need approval."""
+    if state.get("needs_approval", False):
+        return "tools"  # Will be interrupted by HITL
+    return "tools"  # Auto-approved, execute immediately
 
 
 def route_after_validation(state: AgentState) -> str:
@@ -414,6 +683,7 @@ def route_after_refine(state: AgentState) -> str:
 builder = StateGraph(AgentState)
 
 builder.add_node("agent", agent_node)
+builder.add_node("check_tool_approval", check_tool_approval_node)
 builder.add_node("tools", tool_node)
 builder.add_node("validate_answer", validate_answer_node)
 builder.add_node("refine", refine_node)
@@ -422,6 +692,7 @@ builder.add_node("extract_memory", extract_memory_node)
 
 builder.add_edge(START, "agent")
 builder.add_conditional_edges("agent", route_after_agent)
+builder.add_conditional_edges("check_tool_approval", route_after_approval_check)
 builder.add_edge("tools", "agent")
 builder.add_conditional_edges("validate_answer", route_after_validation)
 builder.add_conditional_edges("refine", route_after_refine)
@@ -492,6 +763,9 @@ def get_pending_approval(thread_id: str) -> dict:
 
     Returns the pending node name and a human-readable description of the
     action awaiting approval, so the user can decide to approve or reject.
+    
+    Only returns 'awaiting_approval' if tools actually require human approval
+    based on tool policies. Low-risk tools are auto-approved.
     """
     config = _thread_config(thread_id)
     snapshot = get_agent_hitl().get_state(config)
@@ -505,22 +779,42 @@ def get_pending_approval(thread_id: str) -> dict:
     last_message = last_messages[-1] if last_messages else None
 
     detail = {}
+    
     if pending_node == "tools" and last_message and isinstance(last_message, AIMessage):
         tool_calls = getattr(last_message, "tool_calls", [])
+        
+        # Check which tools require approval
+        requires_approval = get_pending_tool_calls_requiring_approval(tool_calls)
+        
+        if not requires_approval:
+            # All tools are low-risk - auto-approve
+            print(f"[approval] Auto-approving {len(tool_calls)} low-risk tool(s)")
+            # Auto-resume the graph
+            graph = get_agent_hitl()
+            graph.update_state(config, values)
+            return {"status": "auto_approved", "thread_id": thread_id}
+        
+        # High-risk tools found - require human approval
         detail = {
             "pending_node": "tools",
             "action": "execute_tools",
             "tool_calls": [
                 {"name": tc["name"], "args": tc["args"]}
+                for tc in requires_approval
+            ],
+            "auto_approved_tools": [
+                {"name": tc["name"], "args": tc["args"]}
                 for tc in tool_calls
+                if tc not in requires_approval
             ],
         }
     elif pending_node == "extract_memory":
-        detail = {
-            "pending_node": "extract_memory",
-            "action": "extract_and_save_memories",
-            "message": "Agent will analyze the conversation and save personal info/preferences to long-term memory.",
-        }
+        # Check if memory extraction needs approval (medium risk)
+        # For now, auto-approve memory extraction
+        print("[approval] Auto-approving memory extraction")
+        graph = get_agent_hitl()
+        graph.update_state(config, values)
+        return {"status": "auto_approved", "thread_id": thread_id}
     else:
         detail = {
             "pending_node": pending_node,
@@ -643,6 +937,15 @@ def _events_from(stream):
                     "reason": problem,
                 }
 
+            if node == "extract_memory":
+                memory_count = update.get("memory_count", 0)
+                yield {
+                    "node": node,
+                    "event": "memory_extraction",
+                    "status": "completed",
+                    "memories_saved": memory_count,
+                }
+
             if "attempts" in update:
                 yield {
                     "node": node,
@@ -698,7 +1001,7 @@ def thread_is_resumable(thread_id: str) -> bool:
     return bool(snapshot.values) and bool(snapshot.next)
 
 
-def run_agent(question: str, thread_id: str | None = None, user_id: str | None = None) -> dict:
+def run_agent(question: str, thread_id: str | None = None, user_id: str | None = None, attached_documents: list[str] | None = None) -> dict:
     trace = []
     answer = ""
     before = get_llm_stats()
@@ -714,9 +1017,19 @@ def run_agent(question: str, thread_id: str | None = None, user_id: str | None =
         except Exception as exc:
             print(f"[memory] failed to search memories: {exc}")
 
+    attached_info = ""
+    if attached_documents:
+        attached_info = f"Attached documents: {', '.join(attached_documents)}. When searching documents, only search within these files."
+
     messages = [HumanMessage(content=question)]
+    context_parts = []
     if user_memories:
-        system_msg = f"System: {user_memories}\n\n"
+        context_parts.append(user_memories)
+    if attached_info:
+        context_parts.append(attached_info)
+    
+    if context_parts:
+        system_msg = f"System: {' | '.join(context_parts)}\n\n"
         messages.insert(0, HumanMessage(content=system_msg))
 
     inputs: AgentState = {
@@ -826,6 +1139,7 @@ def run_agent_hitl(
     question: str,
     thread_id: str | None = None,
     user_id: str | None = None,
+    attached_documents: list[str] | None = None,
 ) -> dict:
     """Start a question using the human-in-the-loop graph.
 
@@ -833,6 +1147,8 @@ def run_agent_hitl(
     then pauses and returns the pending action for human review. The caller
     uses get_pending_approval() to inspect and resume_with_approval() to
     approve or reject.
+    
+    Low-risk tools are auto-approved and the graph continues automatically.
     """
     before = get_llm_stats()
     config = _thread_config(thread_id)
@@ -846,9 +1162,19 @@ def run_agent_hitl(
         except Exception as exc:
             print(f"[memory] failed to search memories: {exc}")
 
+    attached_info = ""
+    if attached_documents:
+        attached_info = f"Attached documents: {', '.join(attached_documents)}. When searching documents, only search within these files."
+
     messages = [HumanMessage(content=question)]
+    context_parts = []
     if user_memories:
-        system_msg = f"System: {user_memories}\n\n"
+        context_parts.append(user_memories)
+    if attached_info:
+        context_parts.append(attached_info)
+    
+    if context_parts:
+        system_msg = f"System: {' | '.join(context_parts)}\n\n"
         messages.insert(0, HumanMessage(content=system_msg))
 
     inputs: AgentState = {
@@ -857,19 +1183,68 @@ def run_agent_hitl(
         "validation_error": "",
         "user_id": user_id or "",
         "user_memories": user_memories,
+        "needs_approval": False,
+        "pending_tool_calls": [],
     }
 
     trace = []
     answer = ""
     graph = get_agent_hitl()
 
+    # Stream the graph - it will pause at interrupts
     for item in _events_from(graph.stream(inputs, config, stream_mode="updates")):
         trace.append(item)
         if item["event"] == "answer":
             answer = item["content"]
 
+    # Check if we're paused at an interrupt
     snapshot = graph.get_state(config)
-    pending = get_pending_approval(resolved_thread_id)
+    
+    if snapshot.next:
+        # We're paused - check if approval is needed
+        pending_node = snapshot.next[0]
+        values = snapshot.values
+        last_messages = values.get("messages", [])
+        last_message = last_messages[-1] if last_messages else None
+        
+        if pending_node == "tools" and last_message and isinstance(last_message, AIMessage):
+            tool_calls = getattr(last_message, "tool_calls", [])
+            requires_approval = get_pending_tool_calls_requiring_approval(tool_calls)
+            
+            if not requires_approval:
+                # Auto-approve low-risk tools and resume
+                print(f"[approval] Auto-approving {len(tool_calls)} low-risk tool(s)")
+                
+                # Resume the graph
+                for item in _events_from(graph.stream(None, config, stream_mode="updates")):
+                    trace.append(item)
+                    if item["event"] == "answer":
+                        answer = item["content"]
+                
+                # Check if there's another interrupt
+                snapshot = graph.get_state(config)
+                if snapshot.next:
+                    # Still paused - check again
+                    pending = get_pending_approval(resolved_thread_id)
+                else:
+                    # Graph completed
+                    pending = {"status": "completed", "thread_id": resolved_thread_id}
+            else:
+                # High-risk tools - need human approval
+                pending = get_pending_approval(resolved_thread_id)
+        elif pending_node == "extract_memory":
+            # Auto-approve memory extraction
+            print("[approval] Auto-approving memory extraction")
+            for item in _events_from(graph.stream(None, config, stream_mode="updates")):
+                trace.append(item)
+                if item["event"] == "answer":
+                    answer = item["content"]
+            pending = {"status": "completed", "thread_id": resolved_thread_id}
+        else:
+            pending = get_pending_approval(resolved_thread_id)
+    else:
+        # Graph completed normally
+        pending = {"status": "completed", "thread_id": resolved_thread_id}
 
     if user_id:
         try:

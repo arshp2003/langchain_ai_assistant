@@ -1,0 +1,523 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 20px;
+}
+
+.container {
+    width: 100%;
+    max-width: 900px;
+    background: white;
+    border-radius: 16px;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+    display: flex;
+    flex-direction: column;
+    height: 90vh;
+    overflow: hidden;
+}
+
+header {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    padding: 20px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+header h1 {
+    font-size: 24px;
+    margin-bottom: 12px;
+}
+
+.settings {
+    display: flex;
+    gap: 20px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+.settings label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 14px;
+    cursor: pointer;
+}
+
+.settings input[type="checkbox"] {
+    width: 18px;
+    height: 18px;
+    cursor: pointer;
+}
+
+.settings input[type="text"] {
+    padding: 6px 12px;
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.15);
+    color: white;
+    font-size: 14px;
+    width: 150px;
+}
+
+.settings input[type="text"]::placeholder {
+    color: rgba(255, 255, 255, 0.6);
+}
+
+.chat-messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    min-height: 0;
+}
+
+.message {
+    display: flex;
+    animation: fadeIn 0.3s ease-in;
+}
+
+@keyframes fadeIn {
+    from {
+        opacity: 0;
+        transform: translateY(10px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.message.user {
+    justify-content: flex-end;
+}
+
+.message.assistant {
+    justify-content: flex-start;
+}
+
+.message.system {
+    justify-content: center;
+}
+
+.message-content {
+    max-width: 70%;
+    padding: 12px 16px;
+    border-radius: 12px;
+    line-height: 1.5;
+    font-size: 15px;
+}
+
+.message.user .message-content {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    border-bottom-right-radius: 4px;
+}
+
+.message.assistant .message-content {
+    background: #f0f0f0;
+    color: #333;
+    border-bottom-left-radius: 4px;
+}
+
+.message.system .message-content {
+    background: #e3f2fd;
+    color: #1976d2;
+    font-size: 14px;
+    text-align: center;
+}
+
+.message.tool-call .message-content {
+    background: #fff3e0;
+    color: #e65100;
+    border-left: 4px solid #ff9800;
+    font-family: 'Courier New', monospace;
+    font-size: 13px;
+}
+
+.message.approval .message-content {
+    background: #e8f5e9;
+    color: #2e7d32;
+    border-left: 4px solid #4caf50;
+}
+
+.message.rejection .message-content {
+    background: #ffebee;
+    color: #c62828;
+    border-left: 4px solid #f44336;
+}
+
+.approval-panel {
+    background: #fff8e1;
+    border-top: 3px solid #ffa000;
+    padding: 20px;
+    animation: slideUp 0.3s ease-out;
+    max-height: 40vh;
+    overflow-y: auto;
+    flex-shrink: 0;
+}
+
+@keyframes slideUp {
+    from {
+        transform: translateY(100%);
+        opacity: 0;
+    }
+    to {
+        transform: translateY(0);
+        opacity: 1;
+    }
+}
+
+.approval-panel.hidden {
+    display: none;
+}
+
+.approval-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+}
+
+.approval-header h3 {
+    color: #f57c00;
+    font-size: 18px;
+}
+
+.approval-status {
+    font-size: 13px;
+    color: #666;
+    font-style: italic;
+}
+
+.approval-content {
+    background: white;
+    border: 1px solid #ffe0b2;
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 16px;
+    font-family: 'Courier New', monospace;
+    font-size: 14px;
+    line-height: 1.6;
+}
+
+.approval-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.approval-actions textarea {
+    width: 100%;
+    padding: 10px;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    font-family: inherit;
+    font-size: 14px;
+    resize: vertical;
+}
+
+.approval-buttons {
+    display: flex;
+    gap: 12px;
+}
+
+.btn {
+    padding: 10px 24px;
+    border: none;
+    border-radius: 8px;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.btn:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+.btn:active {
+    transform: translateY(0);
+}
+
+.btn-approve {
+    background: #4caf50;
+    color: white;
+    flex: 1;
+}
+
+.btn-approve:hover {
+    background: #45a049;
+}
+
+.btn-reject {
+    background: #f44336;
+    color: white;
+    flex: 1;
+}
+
+.btn-reject:hover {
+    background: #da190b;
+}
+
+.input-area {
+    display: flex;
+    gap: 8px;
+    padding: 20px;
+    background: #f9f9f9;
+    border-top: 1px solid #e0e0e0;
+    align-items: flex-end;
+}
+
+.btn-icon-attach {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    border: none;
+    color: white;
+    font-size: 24px;
+    width: 44px;
+    height: 44px;
+    min-width: 44px;
+    border-radius: 10px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: transform 0.2s;
+}
+
+.btn-icon-attach:hover {
+    transform: scale(1.05);
+}
+
+.attached-files {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 20px 0;
+    flex-wrap: wrap;
+}
+
+.attached-files.hidden {
+    display: none;
+}
+
+.attached-chips {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+.attached-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 500;
+}
+
+.attached-chip .chip-remove {
+    cursor: pointer;
+    font-size: 14px;
+    opacity: 0.8;
+    line-height: 1;
+}
+
+.attached-chip .chip-remove:hover {
+    opacity: 1;
+}
+
+.input-area textarea {
+    flex: 1;
+    padding: 12px;
+    border: 2px solid #e0e0e0;
+    border-radius: 8px;
+    font-family: inherit;
+    font-size: 15px;
+    resize: none;
+    transition: border-color 0.2s;
+}
+
+.input-area textarea:focus {
+    outline: none;
+    border-color: #667eea;
+}
+
+.btn-send {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    padding: 12px 32px;
+}
+
+.btn-send:hover {
+    opacity: 0.9;
+}
+
+.btn-send:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.loading {
+    display: inline-block;
+    width: 20px;
+    height: 20px;
+    border: 3px solid rgba(255, 255, 255, 0.3);
+    border-radius: 50%;
+    border-top-color: white;
+    animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+.message.loading .message-content {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+/* Scrollbar styling */
+.chat-messages::-webkit-scrollbar {
+    width: 8px;
+}
+
+.chat-messages::-webkit-scrollbar-track {
+    background: #f1f1f1;
+}
+
+.chat-messages::-webkit-scrollbar-thumb {
+    background: #888;
+    border-radius: 4px;
+}
+
+.chat-messages::-webkit-scrollbar-thumb:hover {
+    background: #555;
+}
+
+/* Responsive layout */
+@media (max-width: 768px) {
+    body {
+        padding: 0;
+    }
+
+    .container {
+        height: 100vh;
+        max-width: 100%;
+        border-radius: 0;
+    }
+
+    header {
+        padding: 12px;
+    }
+
+    header h1 {
+        font-size: 18px;
+        margin-bottom: 8px;
+    }
+
+    .settings {
+        gap: 10px;
+        font-size: 12px;
+    }
+
+    .settings input[type="text"] {
+        width: 120px;
+        font-size: 12px;
+    }
+
+    .chat-messages {
+        padding: 12px;
+    }
+
+    .message-content {
+        max-width: 85%;
+        font-size: 14px;
+    }
+
+    .approval-panel {
+        padding: 12px;
+        max-height: 35vh;
+    }
+
+    .approval-header h3 {
+        font-size: 15px;
+    }
+
+    .approval-content {
+        padding: 10px;
+        font-size: 12px;
+    }
+
+    .input-area {
+        padding: 12px;
+        gap: 6px;
+    }
+
+    .btn-icon-attach {
+        width: 38px;
+        height: 38px;
+        min-width: 38px;
+        font-size: 20px;
+    }
+
+    .input-area textarea {
+        padding: 10px;
+        font-size: 14px;
+    }
+
+    .btn-send {
+        padding: 10px 20px;
+        font-size: 14px;
+    }
+
+    .approval-buttons {
+        flex-direction: column;
+        gap: 8px;
+    }
+
+    .btn {
+        padding: 10px 16px;
+        font-size: 14px;
+    }
+}
+
+@media (max-height: 600px) {
+    .container {
+        height: 100vh;
+    }
+
+    .approval-panel {
+        max-height: 30vh;
+    }
+
+    header {
+        padding: 8px 12px;
+    }
+
+    header h1 {
+        font-size: 16px;
+        margin-bottom: 4px;
+    }
+
+    .chat-messages {
+        padding: 10px;
+        gap: 10px;
+    }
+}

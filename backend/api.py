@@ -1,6 +1,9 @@
 import json
+import os
+from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -33,6 +36,14 @@ app = FastAPI(
     version="1.0.0",
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 class ChatRequest(BaseModel):
     question: str = Field(
@@ -44,6 +55,11 @@ class ChatRequest(BaseModel):
         default=None,
         description="Optional user ID for long-term memory",
         examples=["user-123"],
+    )
+    attached_documents: list[str] | None = Field(
+        default=None,
+        description="Optional list of filenames to restrict document search to",
+        examples=[["report.pdf", "notes.txt"]],
     )
 
 
@@ -65,7 +81,7 @@ def health() -> dict:
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest) -> ChatResponse:
-    result = run_agent(request.question, user_id=request.user_id)
+    result = run_agent(request.question, user_id=request.user_id, attached_documents=request.attached_documents)
     return ChatResponse(
         question=request.question,
         answer=result["answer"],
@@ -224,7 +240,7 @@ class ApprovalRequest(BaseModel):
 def chat_hitl(request: ChatRequest) -> dict:
     """Start a human-in-the-loop run. Pauses before tool calls and memory
     extraction so the user can review and approve/reject each step."""
-    result = run_agent_hitl(request.question, user_id=request.user_id)
+    result = run_agent_hitl(request.question, user_id=request.user_id, attached_documents=request.attached_documents)
     return result
 
 
@@ -238,6 +254,115 @@ def check_approval(thread_id: str) -> dict:
 def handle_approval(thread_id: str, request: ApprovalRequest) -> dict:
     """Approve or reject the pending action and resume the graph."""
     return resume_with_approval(thread_id, request.approved, request.feedback)
+
+
+# -----------------------------
+# Document Management (RAG)
+# -----------------------------
+
+DOCUMENTS_DIR = Path(__file__).resolve().parent / "data" / "documents"
+CHROMA_DIR = Path(__file__).resolve().parent / "chroma_db"
+
+
+def _get_vector_store():
+    from langchain_chroma import Chroma
+    from embeddings import LocalEmbeddings
+
+    embedding_function = LocalEmbeddings()
+    return Chroma(
+        collection_name="langchain_notes",
+        embedding_function=embedding_function,
+        persist_directory=str(CHROMA_DIR),
+    )
+
+
+def _load_and_chunk(file_path: Path):
+    """Load a document file and split it into chunks."""
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+    suffix = file_path.suffix.lower()
+
+    if suffix == ".pdf":
+        from langchain_community.document_loaders import PyPDFLoader
+        loader = PyPDFLoader(str(file_path))
+    elif suffix in (".txt", ".md"):
+        from langchain_community.document_loaders import TextLoader
+        loader = TextLoader(str(file_path), encoding="utf-8")
+    else:
+        raise ValueError(f"Unsupported file type: {suffix}. Use .pdf, .txt, or .md")
+
+    documents = loader.load()
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    return splitter.split_documents(documents)
+
+
+@app.post("/documents/upload")
+async def upload_document(file: UploadFile) -> dict:
+    """Upload a document (PDF, TXT, or MD), chunk it, and store in the vector database."""
+    DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    file_path = DOCUMENTS_DIR / file.filename
+    content = await file.read()
+    file_path.write_bytes(content)
+
+    try:
+        chunks = _load_and_chunk(file_path)
+        vector_store = _get_vector_store()
+
+        for chunk in chunks:
+            chunk.metadata["source"] = file.filename
+
+        ids = vector_store.add_documents(chunks)
+
+        return {
+            "status": "uploaded",
+            "filename": file.filename,
+            "chunks_created": len(chunks),
+            "vectors_stored": len(ids),
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "filename": file.filename,
+            "error": str(exc),
+        }
+
+
+@app.get("/documents")
+def list_documents() -> dict:
+    """List all uploaded documents."""
+    if not DOCUMENTS_DIR.exists():
+        return {"documents": [], "count": 0}
+
+    documents = []
+    for file_path in DOCUMENTS_DIR.iterdir():
+        if file_path.is_file() and file_path.suffix.lower() in (".pdf", ".txt", ".md"):
+            stat = file_path.stat()
+            documents.append({
+                "filename": file_path.name,
+                "size_bytes": stat.st_size,
+                "type": file_path.suffix[1:].upper(),
+            })
+
+    return {
+        "documents": sorted(documents, key=lambda d: d["filename"]),
+        "count": len(documents),
+    }
+
+
+@app.delete("/documents/{filename}")
+def delete_document(filename: str) -> dict:
+    """Delete a document file. Note: vector embeddings remain in ChromaDB."""
+    file_path = DOCUMENTS_DIR / filename
+    if not file_path.exists():
+        return {"status": "not_found", "filename": filename}
+
+    file_path.unlink()
+    return {
+        "status": "deleted",
+        "filename": filename,
+        "note": "File removed. Vector embeddings may still exist in ChromaDB.",
+    }
 
 
 if __name__ == "__main__":

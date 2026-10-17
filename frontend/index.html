@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LangGraph Agent Chat</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>LangGraph Agent</h1>
+            <div class="settings">
+                <label style="display: none;">
+                    <input type="checkbox" id="hitl-mode" checked>
+                    Human-in-the-Loop Mode
+                </label>
+                <label>
+                    User ID: <input type="text" id="user-id" value="user-123" placeholder="Enter user ID">
+                </label>
+            </div>
+        </header>
+
+        <div id="chat-messages" class="chat-messages">
+            <div class="message system">
+                <div class="message-content">
+                    Welcome! Ask me anything. Upload documents to enable RAG-powered answers.
+                </div>
+            </div>
+        </div>
+
+        <div id="approval-panel" class="approval-panel hidden">
+            <div class="approval-header">
+                <h3>Pending Approval</h3>
+                <span class="approval-status" id="approval-status">Awaiting your decision</span>
+            </div>
+            <div class="approval-content" id="approval-content"></div>
+            <div class="approval-actions">
+                <textarea id="feedback-input" placeholder="Optional feedback (especially when rejecting)..." rows="2"></textarea>
+                <div class="approval-buttons">
+                    <button id="approve-btn" class="btn btn-approve">Approve</button>
+                    <button id="reject-btn" class="btn btn-reject">Reject</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="attached-files" class="attached-files hidden">
+            <div id="attached-chips" class="attached-chips"></div>
+        </div>
+
+        <div class="input-area">
+            <input type="file" id="file-input" accept=".pdf,.txt,.md" hidden>
+            <button id="attach-btn" class="btn-icon-attach" title="Attach document">+</button>
+            <textarea id="user-input" placeholder="Type your message..." rows="2"></textarea>
+            <button id="send-btn" class="btn btn-send">Send</button>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

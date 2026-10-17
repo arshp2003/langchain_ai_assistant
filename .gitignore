@@ -4,3 +4,9 @@ __pycache__/
 *.pyc
 chroma_db/
 data/
+*.egg-info/
+dist/
+build/
+node_modules/
+.DS_Store
+*.log
