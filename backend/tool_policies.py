@@ -63,7 +63,12 @@ TOOL_POLICIES: dict[str, dict[str, Any]] = {
     "delete_memory": {
         "priority": "high",
         "auto_approve": False,
-        "description": "Delete a memory from long-term storage permanently",
+        "description": "Soft delete a memory from long-term storage (can be restored)",
+    },
+    "restore_memory": {
+        "priority": "medium",
+        "auto_approve": True,
+        "description": "Restore a previously deleted memory",
     },
     "delete_file": {
         "priority": "high",

@@ -68,6 +68,8 @@ def init_memory_tables() -> None:
                 value TEXT NOT NULL,
                 importance FLOAT DEFAULT 0.5,
                 embedding vector(384),
+                deleted BOOLEAN DEFAULT FALSE,
+                deleted_at TIMESTAMPTZ,
                 last_accessed TIMESTAMPTZ DEFAULT NOW(),
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 UNIQUE(user_id, category, key)
@@ -76,6 +78,14 @@ def init_memory_tables() -> None:
         conn.execute("""
             ALTER TABLE memories
             ADD COLUMN IF NOT EXISTS embedding vector(384)
+        """)
+        conn.execute("""
+            ALTER TABLE memories
+            ADD COLUMN IF NOT EXISTS deleted BOOLEAN DEFAULT FALSE
+        """)
+        conn.execute("""
+            ALTER TABLE memories
+            ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ
         """)
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_memories_user_id
@@ -144,14 +154,14 @@ def get_user_memories(user_id: str) -> list[dict]:
         rows = conn.execute("""
             SELECT memory_id, category, key, value, importance, last_accessed, created_at
             FROM memories
-            WHERE user_id = %s
+            WHERE user_id = %s AND (deleted = FALSE OR deleted IS NULL)
             ORDER BY importance DESC, last_accessed DESC
         """, (user_id,)).fetchall()
 
         with pool.connection() as update_conn:
             update_conn.execute("""
                 UPDATE memories SET last_accessed = NOW()
-                WHERE user_id = %s
+                WHERE user_id = %s AND (deleted = FALSE OR deleted IS NULL)
             """, (user_id,))
 
     return [
@@ -206,7 +216,7 @@ def semantic_search(user_id: str, query: str, top_k: int = 3) -> list[dict]:
                    1 - (embedding <=> %s::vector) as similarity,
                    last_accessed, created_at
             FROM memories
-            WHERE user_id = %s
+            WHERE user_id = %s AND (deleted = FALSE OR deleted IS NULL)
             ORDER BY embedding <=> %s::vector
             LIMIT %s
         """, (query_embedding, user_id, query_embedding, top_k)).fetchall()
@@ -227,22 +237,54 @@ def semantic_search(user_id: str, query: str, top_k: int = 3) -> list[dict]:
 
 
 def delete_memory(user_id: str, memory_id: str) -> bool:
+    """Soft delete a memory by marking it as deleted."""
+    import uuid
+    
+    # Validate UUID format
+    try:
+        uuid.UUID(memory_id)
+    except (ValueError, AttributeError):
+        raise ValueError(f"Invalid memory_id format: '{memory_id}'. Expected a full UUID like 'e2704ab7-1234-5678-9abc-def012345678'")
+    
     pool = get_memory_pool()
     with pool.connection() as conn:
         result = conn.execute("""
-            DELETE FROM memories
-            WHERE user_id = %s AND memory_id = %s
+            UPDATE memories
+            SET deleted = TRUE, deleted_at = NOW()
+            WHERE user_id = %s AND memory_id = %s AND deleted = FALSE
         """, (user_id, memory_id))
         return result.rowcount > 0
 
 
 def delete_all_user_memories(user_id: str) -> int:
+    """Soft delete all memories for a user."""
     pool = get_memory_pool()
     with pool.connection() as conn:
         result = conn.execute("""
-            DELETE FROM memories WHERE user_id = %s
+            UPDATE memories
+            SET deleted = TRUE, deleted_at = NOW()
+            WHERE user_id = %s AND (deleted = FALSE OR deleted IS NULL)
         """, (user_id,))
         return result.rowcount
+
+
+def restore_memory(user_id: str, memory_id: str) -> bool:
+    """Restore a soft-deleted memory."""
+    import uuid
+    
+    try:
+        uuid.UUID(memory_id)
+    except (ValueError, AttributeError):
+        raise ValueError(f"Invalid memory_id format: '{memory_id}'")
+    
+    pool = get_memory_pool()
+    with pool.connection() as conn:
+        result = conn.execute("""
+            UPDATE memories
+            SET deleted = FALSE, deleted_at = NULL
+            WHERE user_id = %s AND memory_id = %s AND deleted = TRUE
+        """, (user_id, memory_id))
+        return result.rowcount > 0
 
 
 def get_user_profile(user_id: str) -> Optional[dict]:

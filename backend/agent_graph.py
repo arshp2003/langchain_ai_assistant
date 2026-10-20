@@ -41,12 +41,7 @@ from tool_policies import should_require_approval, get_pending_tool_calls_requir
 
 
 # Configurable via .env (OPENROUTER_MODEL) so you can swap slugs without editing code.
-# Fallback chain: if primary model hits rate limit, try these in order.
-MODEL_NAME = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
-FALLBACK_MODELS = [
-    "meta-llama/llama-3.2-3b-instruct:free",
-    "qwen/qwen-2-7b-instruct:free",
-]
+MODEL_NAME = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3.5-super-vl:free")
 
 MAX_ATTEMPTS = 2
 
@@ -171,7 +166,7 @@ def delete_memory(memory_id: str, user_id: str) -> str:
     WARNING: This operation is irreversible. The memory will be permanently removed.
     
     Args:
-        memory_id: The UUID of the memory to delete
+        memory_id: The FULL UUID of the memory to delete (format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx). Do NOT truncate or abbreviate the UUID.
         user_id: The user ID who owns this memory
         
     Returns:
@@ -184,8 +179,34 @@ def delete_memory(memory_id: str, user_id: str) -> str:
         if deleted:
             return f"Successfully deleted memory: {memory_id}"
         return f"Memory not found: {memory_id}"
+    except ValueError as e:
+        return f"Error: {str(e)}. Please use the complete UUID from the list_memories output."
     except Exception as e:
         return f"Error deleting memory: {str(e)}"
+
+
+@tool
+def restore_memory(memory_id: str, user_id: str) -> str:
+    """Restore a previously deleted memory from long-term storage.
+    
+    Args:
+        memory_id: The FULL UUID of the memory to restore (format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
+        user_id: The user ID who owns this memory
+        
+    Returns:
+        Confirmation message or error
+    """
+    from memory import restore_memory as _restore_memory
+    
+    try:
+        restored = _restore_memory(user_id, memory_id)
+        if restored:
+            return f"Successfully restored memory: {memory_id}"
+        return f"Memory not found or was not deleted: {memory_id}"
+    except ValueError as e:
+        return f"Error: {str(e)}. Please use the complete UUID."
+    except Exception as e:
+        return f"Error restoring memory: {str(e)}"
 
 
 @tool
@@ -230,7 +251,7 @@ def list_memories(user_id: str) -> str:
     
     lines = [f"Memories for {user_id}:"]
     for m in memories:
-        lines.append(f"- [{m['memory_id'][:8]}...] {m['key']}: {m['value']} ({m['category']})")
+        lines.append(f"- ID: {m['memory_id']} | {m['key']}: {m['value']} ({m['category']})")
     
     return "\n".join(lines)
 
@@ -244,6 +265,7 @@ tools = [
     list_memories,
     delete_document,
     delete_memory,
+    restore_memory,
 ]
 
 
@@ -251,32 +273,11 @@ tools = [
 # 2. Create models
 # -----------------------------
 
-# Track which model is currently active (for fallback chain)
-_current_model_index = 0
-_all_models = [MODEL_NAME] + FALLBACK_MODELS
+model = ChatOpenRouter(
+    model=MODEL_NAME
+)
 
-def _create_model(model_name: str):
-    """Create a ChatOpenRouter instance for the given model."""
-    return ChatOpenRouter(model=model_name)
-
-model = _create_model(MODEL_NAME)
 model_with_tools = model.bind_tools(tools)
-
-def _switch_to_next_model():
-    """Switch to the next model in the fallback chain. Returns (new_model, new_model_with_tools, switched)."""
-    global _current_model_index, model, model_with_tools
-    
-    if _current_model_index >= len(_all_models) - 1:
-        # No more fallbacks available
-        return model, model_with_tools, False
-    
-    _current_model_index += 1
-    new_model_name = _all_models[_current_model_index]
-    print(f"[fallback] Switching from {_all_models[_current_model_index - 1]} to {new_model_name}")
-    
-    model = _create_model(new_model_name)
-    model_with_tools = model.bind_tools(tools)
-    return model, model_with_tools, True
 
 
 # -----------------------------
@@ -446,7 +447,7 @@ Only extract information that is:
 
 Return ONLY the JSON array, no other text."""
 
-    response, _ = invoke_model(model, [HumanMessage(content=extraction_prompt)])
+    response = invoke_model(model, [HumanMessage(content=extraction_prompt)])
 
     try:
         import json
@@ -498,55 +499,26 @@ def save_extracted_memories(user_id: str, memories: list[dict]) -> int:
 
 
 def invoke_model(runnable, messages):
-    """Call a model, retrying transient OpenRouter errors with backoff + jitter.
-
-    If all retries exhaust on the current model due to rate limit, switches to
-    the next fallback model (if available) and retries from scratch.
-    Returns (response, switched_model_name_or_None).
-    """
-    global model_with_tools
-
-    switched_from = None
-    models_to_try = [_current_model_index]
-
-    # Build list of model indices to try (current + fallbacks)
-    for idx in range(_current_model_index + 1, len(_all_models)):
-        models_to_try.append(idx)
-
-    for model_idx_pos, model_idx in enumerate(models_to_try):
-        # If we need a different model than the current one, switch
-        if model_idx != _current_model_index:
-            switched_from = _all_models[_current_model_index]
-            _switch_to_next_model()
-            runnable = model_with_tools
-            print(f"[fallback] Rate limit exceeded on {switched_from}, shifted to {_all_models[_current_model_index]}")
-
-        slug = _model_slug(runnable)
-        delay = RETRY_BASE_DELAY
-        for attempt in range(1, MAX_RETRIES + 1):
-            _record(requests=1, slug=slug)
-            try:
-                response = runnable.invoke(messages)
-                _record(usage=getattr(response, "usage_metadata", None))
-                return response, switched_from
-            except RETRYABLE_ERRORS as exc:
-                _record(failures=1)
-                is_rate_limit = isinstance(exc, TooManyRequestsResponseError)
-                if attempt == MAX_RETRIES:
-                    if is_rate_limit and model_idx_pos < len(models_to_try) - 1:
-                        # Exhausted retries on this model due to rate limit — try next fallback
-                        break
-                    raise
-                wait = min(delay, RETRY_MAX_DELAY) + random.uniform(0, 1)
-                print(
-                    f"[retry] {type(exc).__name__} on attempt {attempt}/{MAX_RETRIES}; "
-                    f"waiting {wait:.1f}s before retry"
-                )
-                time.sleep(wait)
-                delay *= 2
-
-    # Should not reach here, but just in case
-    raise RuntimeError("All models exhausted")
+    """Call a model, retrying transient OpenRouter errors with backoff + jitter."""
+    slug = _model_slug(runnable)
+    delay = RETRY_BASE_DELAY
+    for attempt in range(1, MAX_RETRIES + 1):
+        _record(requests=1, slug=slug)
+        try:
+            response = runnable.invoke(messages)
+            _record(usage=getattr(response, "usage_metadata", None))
+            return response
+        except RETRYABLE_ERRORS as exc:
+            _record(failures=1)
+            if attempt == MAX_RETRIES:
+                raise
+            wait = min(delay, RETRY_MAX_DELAY) + random.uniform(0, 1)
+            print(
+                f"[retry] {type(exc).__name__} on attempt {attempt}/{MAX_RETRIES}; "
+                f"waiting {wait:.1f}s before retry"
+            )
+            time.sleep(wait)
+            delay *= 2
 
 
 # -----------------------------
@@ -554,16 +526,8 @@ def invoke_model(runnable, messages):
 # -----------------------------
 
 def agent_node(state: AgentState) -> dict:
-    response, switched_from = invoke_model(model_with_tools, state["messages"])
-    messages = []
-    if switched_from:
-        # Notify the user that we switched models due to rate limit
-        switch_msg = AIMessage(
-            content=f"Note: The model '{switched_from}' exceeded its rate limit. Switched to '{_all_models[_current_model_index]}' to continue.",
-        )
-        messages.append(switch_msg)
-    messages.append(response)
-    return {"messages": messages}
+    response = invoke_model(model_with_tools, state["messages"])
+    return {"messages": [response]}
 
 
 def validate_answer_node(state: AgentState) -> dict:
@@ -577,7 +541,7 @@ def refine_node(state: AgentState) -> dict:
         "Give a corrected, self-contained final answer. "
         "Do not ask for more information."
     )
-    response, _ = invoke_model(
+    response = invoke_model(
         model, [*state["messages"], HumanMessage(content=prompt)]
     )
     return {
@@ -592,7 +556,7 @@ def fallback_node(state: AgentState) -> dict:
         "Answer the question directly in one short sentence. "
         "Do not ask questions and do not refuse."
     )
-    response, _ = invoke_model(
+    response = invoke_model(
         model, [*state["messages"], HumanMessage(content=prompt)]
     )
     return {"messages": [response], "validation_error": ""}
@@ -765,10 +729,11 @@ def get_pending_approval(thread_id: str) -> dict:
     action awaiting approval, so the user can decide to approve or reject.
     
     Only returns 'awaiting_approval' if tools actually require human approval
-    based on tool policies. Low-risk tools are auto-approved.
+    based on tool policies. Low-risk tools are auto-approved and the graph resumes.
     """
     config = _thread_config(thread_id)
-    snapshot = get_agent_hitl().get_state(config)
+    graph = get_agent_hitl()
+    snapshot = graph.get_state(config)
 
     if not snapshot.next:
         return {"status": "no_pending_action", "thread_id": thread_id}
@@ -787,12 +752,24 @@ def get_pending_approval(thread_id: str) -> dict:
         requires_approval = get_pending_tool_calls_requiring_approval(tool_calls)
         
         if not requires_approval:
-            # All tools are low-risk - auto-approve
+            # All tools are low-risk - auto-approve and resume
             print(f"[approval] Auto-approving {len(tool_calls)} low-risk tool(s)")
-            # Auto-resume the graph
-            graph = get_agent_hitl()
-            graph.update_state(config, values)
-            return {"status": "auto_approved", "thread_id": thread_id}
+            # Resume the graph
+            trace = []
+            answer = ""
+            for item in _events_from(graph.stream(None, config, stream_mode="updates")):
+                trace.append(item)
+                if item["event"] == "answer":
+                    answer = item["content"]
+            
+            # Check if there's another interrupt
+            new_snapshot = graph.get_state(config)
+            if new_snapshot.next:
+                # Still paused - recursively check
+                return get_pending_approval(thread_id)
+            else:
+                # Graph completed
+                return {"status": "completed", "thread_id": thread_id, "answer": answer}
         
         # High-risk tools found - require human approval
         detail = {
@@ -809,12 +786,23 @@ def get_pending_approval(thread_id: str) -> dict:
             ],
         }
     elif pending_node == "extract_memory":
-        # Check if memory extraction needs approval (medium risk)
-        # For now, auto-approve memory extraction
+        # Auto-approve memory extraction and resume
         print("[approval] Auto-approving memory extraction")
-        graph = get_agent_hitl()
-        graph.update_state(config, values)
-        return {"status": "auto_approved", "thread_id": thread_id}
+        trace = []
+        answer = ""
+        for item in _events_from(graph.stream(None, config, stream_mode="updates")):
+            trace.append(item)
+            if item["event"] == "answer":
+                answer = item["content"]
+        
+        # Check if there's another interrupt
+        new_snapshot = graph.get_state(config)
+        if new_snapshot.next:
+            # Still paused - recursively check
+            return get_pending_approval(thread_id)
+        else:
+            # Graph completed
+            return {"status": "completed", "thread_id": thread_id, "answer": answer}
     else:
         detail = {
             "pending_node": pending_node,
