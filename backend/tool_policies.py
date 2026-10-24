@@ -23,6 +23,11 @@ TOOL_POLICIES: dict[str, dict[str, Any]] = {
         "auto_approve": True,
         "description": "List all uploaded documents",
     },
+    "get_document_download_link": {
+        "priority": "low",
+        "auto_approve": True,
+        "description": "Generate a download link for an uploaded document",
+    },
     "list_memories": {
         "priority": "low",
         "auto_approve": True,

@@ -1,13 +1,17 @@
 """Test script to demonstrate long-term memory system."""
 import os
 import sys
+from pathlib import Path
 from dotenv import load_dotenv
+
+# Add backend directory to path so imports work from tests/ folder
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # Fix Windows console encoding
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8')
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
 
 from agent_graph import run_agent
 from memory import get_user_memories, init_memory_tables

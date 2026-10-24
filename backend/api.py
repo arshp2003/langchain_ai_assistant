@@ -4,7 +4,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from agent_graph import (
@@ -363,6 +363,20 @@ def delete_document(filename: str) -> dict:
         "filename": filename,
         "note": "File removed. Vector embeddings may still exist in ChromaDB.",
     }
+
+
+@app.get("/documents/{filename}/download")
+def download_document(filename: str):
+    """Download a document file."""
+    file_path = DOCUMENTS_DIR / filename
+    if not file_path.exists():
+        return {"status": "not_found", "filename": filename}
+
+    return FileResponse(
+        path=str(file_path),
+        filename=filename,
+        media_type="application/octet-stream",
+    )
 
 
 if __name__ == "__main__":

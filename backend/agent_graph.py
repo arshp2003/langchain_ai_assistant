@@ -95,7 +95,9 @@ def search_documents(query: str, filenames: list[str] = None) -> str:
             persist_directory=str(Path(__file__).resolve().parent / "chroma_db")
         )
         
-        retriever = vector_store.as_retriever(search_kwargs={"k": 5})
+        # Fetch a wide candidate pool (k=10) so the cross-encoder reranker
+        # has enough material to pick the truly best chunks from.
+        retriever = vector_store.as_retriever(search_kwargs={"k": 10})
         docs = retriever.invoke(query)
         
         if not docs:
@@ -106,8 +108,28 @@ def search_documents(query: str, filenames: list[str] = None) -> str:
             if not docs:
                 return f"No relevant content found in the attached files: {', '.join(filenames)}"
         
+        # Cross-encoder reranking: re-score candidates by actual query relevance
+        from reranker import rerank, filter_relevant
+        from trimmer import trim_passages
+        from compressor import compress_context
+        from validator import validate_compression
+        scored_docs = rerank(query, docs, top_k=3)
+        scored_docs = filter_relevant(scored_docs)
+        
+        if not scored_docs:
+            return "No relevant documents found in the knowledge base."
+        
+        # Trim each kept chunk to only its query-relevant sentences
+        trimmed_docs = trim_passages(query, scored_docs)
+        
+        # Compress the trimmed context further if it's still long
+        compressed_docs = compress_context(query, trimmed_docs)
+        
+        # Validate that compression didn't lose answer-relevant information
+        scored_docs = validate_compression(query, trimmed_docs, compressed_docs)
+        
         result = []
-        for i, doc in enumerate(docs[:3], 1):
+        for i, (doc, score) in enumerate(scored_docs, 1):
             source = doc.metadata.get("source", "Unknown")
             result.append(f"[Document {i} - {source}]\n{doc.page_content}")
         
@@ -234,6 +256,32 @@ def list_documents() -> str:
 
 
 @tool
+def get_document_download_link(filename: str) -> str:
+    """Generate a download link for an uploaded document.
+    
+    Use this when the user asks to download a file or wants a link to access
+    their uploaded document.
+    
+    Args:
+        filename: The exact filename of the document (e.g., "report.pdf")
+        
+    Returns:
+        A download URL or error message if the file doesn't exist
+    """
+    from pathlib import Path
+    
+    documents_dir = Path(__file__).resolve().parent / "data" / "documents"
+    file_path = documents_dir / filename
+    
+    if not file_path.exists():
+        return f"Document not found: {filename}. Use list_documents to see available files."
+    
+    # The API runs on port 8000 by default
+    download_url = f"http://127.0.0.1:8000/documents/{filename}/download"
+    return f"Download link for {filename}: {download_url}"
+
+
+@tool
 def list_memories(user_id: str) -> str:
     """List all memories for a user.
     
@@ -262,6 +310,7 @@ tools = [
     divide_numbers,
     search_documents,
     list_documents,
+    get_document_download_link,
     list_memories,
     delete_document,
     delete_memory,

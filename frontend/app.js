@@ -31,8 +31,80 @@ function addMessage(content, type = 'assistant') {
     
     const contentDiv = document.createElement('div');
     contentDiv.className = 'message-content';
-    contentDiv.textContent = content;
     
+    // Parse markdown-style links [text](url) and bare URLs
+    let htmlContent = content;
+    
+    // First, handle markdown links: [text](url)
+    const markdownLinkRegex = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g;
+    htmlContent = htmlContent.replace(markdownLinkRegex, (match, text, url) => {
+        return `<a href="${url}" target="_blank" rel="noopener noreferrer">${text}</a>`;
+    });
+    
+    // Then, handle bare URLs that aren't already inside links
+    const bareUrlRegex = /(?<!["'>])(https?:\/\/[^\s<]+)/g;
+    htmlContent = htmlContent.replace(bareUrlRegex, (url) => {
+        // Clean up trailing punctuation that might not be part of the URL
+        const cleanUrl = url.replace(/[.,;:!?)]+$/, '');
+        const trailing = url.slice(cleanUrl.length);
+        return `<a href="${cleanUrl}" target="_blank" rel="noopener noreferrer">${cleanUrl}</a>${trailing}`;
+    });
+    
+    // Convert newlines to <br> for proper formatting
+    htmlContent = htmlContent.replace(/\n/g, '<br>');
+    
+    contentDiv.innerHTML = htmlContent;
+    
+    messageDiv.appendChild(contentDiv);
+    chatMessages.appendChild(messageDiv);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+    
+    return messageDiv;
+}
+
+function addMessageWithFiles(content, files, type = 'user') {
+    const messageDiv = document.createElement('div');
+    messageDiv.className = `message ${type}`;
+    
+    const contentDiv = document.createElement('div');
+    contentDiv.className = 'message-content';
+    
+    // Add file attachments at the top with distinct styling
+    if (files && files.length > 0) {
+        const filesDiv = document.createElement('div');
+        filesDiv.className = 'message-files';
+        files.forEach(filename => {
+            const fileSpan = document.createElement('span');
+            fileSpan.className = 'message-file-chip';
+            fileSpan.innerHTML = `<span class="file-icon">📎</span><span class="file-name">${filename}</span>`;
+            filesDiv.appendChild(fileSpan);
+        });
+        contentDiv.appendChild(filesDiv);
+    }
+    
+    // Add message text below files
+    const textDiv = document.createElement('div');
+    textDiv.className = 'message-text';
+    
+    let htmlContent = content;
+    
+    // Parse markdown-style links [text](url) and bare URLs
+    const markdownLinkRegex = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g;
+    htmlContent = htmlContent.replace(markdownLinkRegex, (match, text, url) => {
+        return `<a href="${url}" target="_blank" rel="noopener noreferrer">${text}</a>`;
+    });
+    
+    const bareUrlRegex = /(?<!["'>])(https?:\/\/[^\s<]+)/g;
+    htmlContent = htmlContent.replace(bareUrlRegex, (url) => {
+        const cleanUrl = url.replace(/[.,;:!?)]+$/, '');
+        const trailing = url.slice(cleanUrl.length);
+        return `<a href="${cleanUrl}" target="_blank" rel="noopener noreferrer">${cleanUrl}</a>${trailing}`;
+    });
+    
+    htmlContent = htmlContent.replace(/\n/g, '<br>');
+    textDiv.innerHTML = htmlContent;
+    
+    contentDiv.appendChild(textDiv);
     messageDiv.appendChild(contentDiv);
     chatMessages.appendChild(messageDiv);
     chatMessages.scrollTop = chatMessages.scrollHeight;
@@ -95,7 +167,15 @@ async function sendMessage() {
     
     const userId = userIdInput.value.trim() || 'user-123';
     
-    addMessage(message, 'user');
+    // Capture attached files before clearing
+    const filesToSend = [...attachedDocuments];
+    
+    // Clear attached files immediately
+    attachedDocuments = [];
+    renderAttachedChips();
+    
+    // Add message with file attachments shown separately
+    addMessageWithFiles(message, filesToSend, 'user');
     userInput.value = '';
     sendBtn.disabled = true;
     addLoadingMessage();
@@ -256,6 +336,9 @@ fileInput.addEventListener('change', async () => {
     const file = fileInput.files[0];
     if (!file) return;
 
+    // Show file as attachment preview above input (like ChatGPT)
+    attachDocument(file.name);
+
     try {
         const formData = new FormData();
         formData.append('file', file);
@@ -268,10 +351,11 @@ fileInput.addEventListener('change', async () => {
         const data = await response.json();
 
         if (data.status === 'uploaded') {
-            addMessage(`Document "${file.name}" uploaded and indexed (${data.chunks_created} chunks).`, 'system');
-            attachDocument(file.name);
+            // File uploaded successfully - it's now attached and ready to send with next message
+            console.log(`File "${file.name}" uploaded and indexed (${data.chunks_created} chunks)`);
         } else {
             addMessage(`Upload error: ${data.error}`, 'system');
+            detachDocument(file.name);
         }
     } catch (error) {
         if (error.name === 'AbortError') {
@@ -279,6 +363,7 @@ fileInput.addEventListener('change', async () => {
         } else {
             addMessage(`Upload failed: ${error.message}`, 'system');
         }
+        detachDocument(file.name);
     }
 
     fileInput.value = '';
@@ -306,7 +391,8 @@ function renderAttachedChips() {
     attachedFilesSection.classList.remove('hidden');
     attachedChips.innerHTML = attachedDocuments.map(filename => `
         <span class="attached-chip">
-            ${filename}
+            <span class="chip-icon">📎</span>
+            <span class="chip-name">${filename}</span>
             <span class="chip-remove" onclick="detachDocument('${filename}')">×</span>
         </span>
     `).join('');

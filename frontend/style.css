@@ -131,6 +131,54 @@ header h1 {
     border-bottom-left-radius: 4px;
 }
 
+.message.assistant .message-content a {
+    color: #667eea;
+    text-decoration: underline;
+    font-weight: 500;
+    word-break: break-all;
+}
+
+.message.assistant .message-content a:hover {
+    color: #764ba2;
+    text-decoration: none;
+}
+
+/* File attachments in messages */
+.message-files {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+.message-file-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    background: rgba(255, 255, 255, 0.2);
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 500;
+}
+
+.file-icon {
+    font-size: 12px;
+}
+
+.file-name {
+    max-width: 120px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.message-text {
+    line-height: 1.5;
+}
+
 .message.system .message-content {
     background: #e3f2fd;
     color: #1976d2;
@@ -305,8 +353,10 @@ header h1 {
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 8px 20px 0;
+    padding: 12px 20px 0;
     flex-wrap: wrap;
+    border-top: 1px solid #e0e0e0;
+    background: #fafafa;
 }
 
 .attached-files.hidden {
@@ -315,31 +365,48 @@ header h1 {
 
 .attached-chips {
     display: flex;
-    gap: 6px;
+    gap: 8px;
     flex-wrap: wrap;
 }
 
 .attached-chip {
     display: inline-flex;
     align-items: center;
-    gap: 6px;
-    padding: 4px 10px;
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-    color: white;
-    border-radius: 12px;
-    font-size: 12px;
+    gap: 8px;
+    padding: 8px 12px;
+    background: white;
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+    font-size: 13px;
     font-weight: 500;
+    color: #333;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
 }
 
-.attached-chip .chip-remove {
-    cursor: pointer;
+.chip-icon {
     font-size: 14px;
-    opacity: 0.8;
-    line-height: 1;
 }
 
-.attached-chip .chip-remove:hover {
+.chip-name {
+    max-width: 150px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.chip-remove {
+    cursor: pointer;
+    font-size: 16px;
+    opacity: 0.5;
+    line-height: 1;
+    padding: 0 2px;
+    border-radius: 50%;
+    transition: all 0.2s;
+}
+
+.chip-remove:hover {
     opacity: 1;
+    background: #f0f0f0;
 }
 
 .input-area textarea {
