@@ -95,10 +95,11 @@ def search_documents(query: str, filenames: list[str] = None) -> str:
             persist_directory=str(Path(__file__).resolve().parent / "chroma_db")
         )
         
-        # Fetch a wide candidate pool (k=10) so the cross-encoder reranker
-        # has enough material to pick the truly best chunks from.
-        retriever = vector_store.as_retriever(search_kwargs={"k": 10})
-        docs = retriever.invoke(query)
+        # Fetch a wide candidate pool from BOTH vector search and BM25 keyword
+        # search, so the cross-encoder reranker has enough material to pick the
+        # truly best chunks from.
+        from hybrid_search import hybrid_search
+        docs = hybrid_search(vector_store, query)
         
         if not docs:
             return "No relevant documents found in the knowledge base."
@@ -173,6 +174,9 @@ def delete_document(filename: str) -> str:
                 persist_directory=str(Path(__file__).resolve().parent / "chroma_db")
             )
             vector_store._collection.delete(where={"source": filename})
+
+            from hybrid_search import invalidate_bm25
+            invalidate_bm25()
         except Exception as e:
             print(f"[delete] Warning: could not remove vectors: {e}")
         

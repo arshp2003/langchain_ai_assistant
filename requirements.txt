@@ -40,11 +40,13 @@ transformers==5.19.0
 # --- Vector store ---
 chromadb==1.5.9
 langchain-chroma==1.1.0
+rank-bm25==0.2.2            # BM25 keyword search in hybrid_search.py
 
 # --- API ---
 fastapi==0.142.2
 pydantic==2.12.5
 uvicorn==0.53.0
+python-multipart==0.0.20    # UploadFile support for /documents/upload
 
 # --- Config ---
-python-dotenv==1.2.3python-multipart
+python-dotenv==1.2.4

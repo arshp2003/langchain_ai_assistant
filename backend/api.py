@@ -314,6 +314,9 @@ async def upload_document(file: UploadFile) -> dict:
 
         ids = vector_store.add_documents(chunks)
 
+        from hybrid_search import invalidate_bm25
+        invalidate_bm25()
+
         return {
             "status": "uploaded",
             "filename": file.filename,
