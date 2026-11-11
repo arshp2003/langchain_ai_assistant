@@ -29,6 +29,11 @@ from langchain_core.documents import Document
 VECTOR_K = 10
 KEYWORD_K = 10
 
+# Ceiling on the pool handed to the cross-encoder once every phrasing has been
+# searched. Without it, three phrasings could push ~60 pairs through the
+# reranker for a question that only needs its top 3.
+MAX_CANDIDATES = 30
+
 _bm25_retriever = None
 _bm25_lock = threading.Lock()
 _bm25_doc_count = 0
@@ -133,6 +138,59 @@ def hybrid_search(vector_store, query: str) -> list[Document]:
     print(
         f"[hybrid] vector={len(vector_docs)} keyword={len(keyword_docs)} "
         f"merged_unique={len(merged)}"
+    )
+
+    return merged
+
+
+def _interleave(pools: list[list[Document]], cap: int) -> list[Document]:
+    """Round-robin the pools by rank, deduping, until the cap is reached.
+
+    Concatenating would let the first phrasing fill the whole budget and push
+    every later phrasing's best matches past the cap. Walking rank 0 of each
+    pool, then rank 1 of each, guarantees each variant contributes its top hits
+    before any variant's weaker tail survives.
+    """
+    seen = set()
+    interleaved = []
+
+    deepest = max((len(pool) for pool in pools), default=0)
+
+    for rank in range(deepest):
+        for pool in pools:
+            if rank >= len(pool):
+                continue
+
+            doc = pool[rank]
+            if doc.page_content in seen:
+                continue
+
+            seen.add(doc.page_content)
+            interleaved.append(doc)
+
+            if len(interleaved) >= cap:
+                return interleaved
+
+    return interleaved
+
+
+def multi_query_search(
+    vector_store,
+    queries: list[str],
+    cap: int = MAX_CANDIDATES,
+) -> list[Document]:
+    """Run hybrid search for every phrasing and merge one candidate pool.
+
+    The pools are handed to the cross-encoder reranker unscored and unfused:
+    retrieval ranks are ordinal and not comparable across phrasings, so ranking
+    is left entirely to the reranker downstream.
+    """
+    pools = [hybrid_search(vector_store, q) for q in queries]
+    merged = _interleave(pools, cap)
+
+    print(
+        f"[multi-query] {len(queries)} phrasings -> "
+        f"{sum(len(p) for p in pools)} raw -> {len(merged)} candidates"
     )
 
     return merged

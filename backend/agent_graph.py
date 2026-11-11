@@ -68,6 +68,13 @@ def divide_numbers(a: int, b: int) -> float:
     return a / b
 
 
+def _only_from_files(docs: list, filenames: list[str] | None) -> list:
+    """Keep only chunks that came from the files the caller asked for."""
+    if not filenames:
+        return docs
+    return [d for d in docs if d.metadata.get("source") in filenames]
+
+
 @tool
 def search_documents(query: str, filenames: list[str] = None) -> str:
     """Search through uploaded documents to find relevant information.
@@ -95,28 +102,37 @@ def search_documents(query: str, filenames: list[str] = None) -> str:
             persist_directory=str(Path(__file__).resolve().parent / "chroma_db")
         )
         
-        # Fetch a wide candidate pool from BOTH vector search and BM25 keyword
-        # search, so the cross-encoder reranker has enough material to pick the
-        # truly best chunks from.
-        from hybrid_search import hybrid_search
-        docs = hybrid_search(vector_store, query)
-        
-        if not docs:
-            return "No relevant documents found in the knowledge base."
-        
-        if filenames:
-            docs = [d for d in docs if d.metadata.get("source") in filenames]
-            if not docs:
-                return f"No relevant content found in the attached files: {', '.join(filenames)}"
-        
-        # Cross-encoder reranking: re-score candidates by actual query relevance
-        from reranker import rerank, filter_relevant
+        from reranker import rerank, filter_relevant, DEFAULT_MIN_SCORE
+        from query_transform import expand_queries
+        from hybrid_search import hybrid_search, multi_query_search
         from trimmer import trim_passages
         from compressor import compress_context
         from validator import validate_compression
+
+        # First pass searches the query exactly as written, so a normal search
+        # costs no extra model request.
+        docs = _only_from_files(hybrid_search(vector_store, query), filenames)
         scored_docs = rerank(query, docs, top_k=3)
+
+        # Conditional multi-query expansion. Both retrievers are fed the same
+        # string, so one unlucky phrasing fails them together and rephrasings
+        # rarely miss the same way - but generating them costs a request against
+        # a 50/day cap, and on this corpus they only ever helped when the plain
+        # search came up dry. So expand only when nothing clears the relevance
+        # bar, reusing reranker's threshold instead of tuning a second one.
+        if not scored_docs or scored_docs[0][1] < DEFAULT_MIN_SCORE:
+            docs = _only_from_files(
+                multi_query_search(vector_store, expand_queries(query)), filenames
+            )
+            scored_docs = rerank(query, docs, top_k=3)
+
+        if not docs:
+            if filenames:
+                return f"No relevant content found in the attached files: {', '.join(filenames)}"
+            return "No relevant documents found in the knowledge base."
+
         scored_docs = filter_relevant(scored_docs)
-        
+
         if not scored_docs:
             return "No relevant documents found in the knowledge base."
         
