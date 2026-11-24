@@ -15,12 +15,12 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dotenv import load_dotenv
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
 
 from langchain_chroma import Chroma
 from embeddings import LocalEmbeddings
 import hybrid_search
-from hybrid_search import hybrid_search as do_hybrid, _dedupe, VECTOR_K
+from hybrid_search import hybrid_search as do_hybrid, _dedupe, tokenize, VECTOR_K
 
 
 def get_store():
@@ -85,7 +85,7 @@ print("Explicit duplicate collapse: OK")
 original = hybrid_search.get_bm25_retriever
 
 
-def boom(_vs):
+def boom(_vs, sources=None):
     raise RuntimeError("simulated BM25 outage")
 
 
@@ -109,5 +109,46 @@ assert hybrid_search._bm25_retriever is None, "invalidate must drop the cached i
 do_hybrid(store, QUERY)
 assert hybrid_search._bm25_retriever is not None, "search must rebuild the index"
 print("Index invalidation + lazy rebuild: OK")
+
+# -----------------------------
+# 6: Scoped search reads only the requested file
+# -----------------------------
+from collections import Counter
+
+counts = Counter((m or {}).get("source", "") for m in store.get()["metadatas"])
+target = "Arsh_GenAI.pdf" if "Arsh_GenAI.pdf" in counts else min(counts, key=counts.get)
+
+scoped = do_hybrid(store, QUERY, sources=[target])
+assert scoped, f"scoping to {target} must still find its chunks"
+assert {d.metadata.get("source") for d in scoped} == {target}, (
+    "A scoped pool must never contain another file's chunks"
+)
+print(
+    f"\nScoped to {target}: {len(scoped)} candidates, "
+    f"corpus owns {counts[target]} of {sum(counts.values())} chunks"
+)
+
+# The whole point of pushing the filter down instead of applying it afterwards:
+# a file holding a handful of chunks has to outvote the rest of the corpus just
+# to reach an unscoped top-k pool.
+file_specific = "programming language Python skills"
+unscoped = do_hybrid(store, file_specific)
+reach = sum(1 for d in unscoped if d.metadata.get("source") == target)
+print(
+    f"Same query unscoped: {reach} of {len(unscoped)} candidates came from "
+    f"{target} -> the other {counts[target] - reach} were invisible to a "
+    f"post-filter"
+)
+
+# -----------------------------
+# 7: Tokenizer gives corpus and query a shared vocabulary
+# -----------------------------
+assert tokenize("MVCC.") == ["mvcc"], tokenize("MVCC.")
+assert tokenize("LangChain provides RAG!") == ["langchain", "provides", "rag"]
+assert tokenize("MVCC.") != "MVCC.".split(), (
+    "The library default keeps case and punctuation, so 'MVCC.' never matched "
+    "a query for 'MVCC'"
+)
+print("Punctuation- and case-insensitive tokenizing: OK")
 
 print("\nPASS: hybrid retrieval verified")

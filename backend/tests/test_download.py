@@ -15,7 +15,7 @@ import requests
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dotenv import load_dotenv
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
 
 
 API_BASE = "http://127.0.0.1:8000"
@@ -78,7 +78,7 @@ def test_download_tool():
 
     # Test with a real file
     from pathlib import Path
-    documents_dir = Path(__file__).resolve().parent / "data" / "documents"
+    documents_dir = Path(__file__).resolve().parent.parent / "data" / "documents"
 
     if documents_dir.exists():
         files = list(documents_dir.iterdir())

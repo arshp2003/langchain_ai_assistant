@@ -1,12 +1,16 @@
-"""Manual test for conditional multi-query expansion.
+"""Manual test for conditional multi-query expansion and file scoping.
 
 Run:  python test_conditional_expansion.py
 
 The retrievers, reranker and downstream stages are stubbed so each check asserts
 one thing about the gate: expansion (the only stage that costs a model request)
-fires on weak retrieval scores and stays silent on strong ones. Zero API calls.
-`filter_relevant` is left real, since the honest "nothing found" reply depends
-on the same threshold the gate uses.
+fires when the candidate pool is EMPTY and stays silent otherwise. Zero API
+calls. `filter_relevant` is left real, since the LOW CONFIDENCE reply and the
+honest "nothing found" reply both depend on the same threshold it uses.
+
+Why empty-pool and not low-score: every phrasing is fed to the same two
+retrievers that just ranked the weak pool, so rewording cannot repair a ranking
+problem - it can only find chunks the first wording could not reach at all.
 
 Follow-up: python test_query_transform.py
 """
@@ -17,7 +21,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dotenv import load_dotenv
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
 
 from langchain_core.documents import Document
 
@@ -49,33 +53,40 @@ def run_search(query, filenames=None):
 class Harness:
     """Drive search_documents with the retrieval stack faked.
 
-    scores_single / scores_multi are the cross-encoder scores returned per pass,
-    highest first, which is what rerank() actually guarantees.
+    pool is what the first search pass finds; expanded_pool is what the pass
+    over generated phrasings finds (defaults to the first pool plus one chunk
+    only the rewording reaches). scores_single / scores_multi are the
+    cross-encoder scores returned per pass, highest first, which is what
+    rerank() actually guarantees.
     """
 
-    def __init__(self, pool=None, scores_single=(), scores_multi=None):
+    def __init__(self, pool=None, scores_single=(), scores_multi=None,
+                 expanded_pool=None):
         self.pool = pool if pool is not None else [D("chunk A"), D("chunk B")]
+        self.expanded_pool = (
+            expanded_pool if expanded_pool is not None
+            else self.pool + [D("chunk C")]
+        )
         self.scores_single = list(scores_single)
         self.scores_multi = (
             self.scores_single if scores_multi is None else list(scores_multi)
         )
-        self.single_pass_calls = 0
         self.multi_calls = 0
         self.expansion_requests = 0
         self.phrasings = []
+        self.scopes = []
         self._saved = {}
 
-    def hybrid(self, store, query):
-        self.single_pass_calls += 1
-        return list(self.pool)
-
-    def multi(self, store, queries, cap=30):
+    def multi(self, store, queries, cap=30, sources=None):
         self.multi_calls += 1
-        self.phrasings = list(queries)
-        return list(self.pool) + [D("chunk C")]
+        self.phrasings.append(list(queries))
+        self.scopes.append(sorted(sources) if sources else None)
+        if self.multi_calls == 1:
+            return list(self.pool)
+        return list(self.expanded_pool)
 
     def rerank(self, query, docs, top_k=3):
-        scores = self.scores_multi if self.multi_calls else self.scores_single
+        scores = self.scores_multi if self.multi_calls > 1 else self.scores_single
         return list(zip(docs, scores))[:top_k]
 
     def invoke(self, runnable, messages):
@@ -86,7 +97,6 @@ class Harness:
 
     def __enter__(self):
         self._saved = {
-            (hybrid_module, "hybrid_search"): hybrid_module.hybrid_search,
             (hybrid_module, "multi_query_search"): hybrid_module.multi_query_search,
             (reranker_module, "rerank"): reranker_module.rerank,
             (agent_graph, "invoke_model"): agent_graph.invoke_model,
@@ -94,7 +104,6 @@ class Harness:
             (compressor_module, "compress_context"): compressor_module.compress_context,
             (validator_module, "validate_compression"): validator_module.validate_compression,
         }
-        hybrid_module.hybrid_search = self.hybrid
         hybrid_module.multi_query_search = self.multi
         reranker_module.rerank = self.rerank
         agent_graph.invoke_model = self.invoke
@@ -118,48 +127,53 @@ def run(harness, query, filenames=None):
 # 1. Strong retrieval pays nothing
 # -----------------------------
 h, out = run(Harness(scores_single=[5.9, 2.1]), "how does chunking work")
-assert h.multi_calls == 0, "strong first pass must not expand"
-assert h.phrasings == [], "expand_queries must not even run"
+assert h.multi_calls == 1, "the first pass must search, not skip"
 assert h.expansion_requests == 0, "expansion costs a request; none allowed here"
+assert len(h.phrasings) == 1, f"expected one search pass, got {h.phrasings}"
 assert "chunk A" in out, out
-print("1. Strong score (+5.9) -> single pass, 0 model requests: OK")
+print("1. Strong score (+5.9) -> one pass, 0 model requests: OK")
 
 # -----------------------------
-# 2. Weak retrieval expands exactly once
+# 2. Weak scores do NOT trigger expansion
+#    This is the whole point of the gate: the pool is full, the ranking is just
+#    poor, and rewording goes back through the same retrievers. The model gets
+#    the best candidate labelled LOW CONFIDENCE instead.
 # -----------------------------
 h, out = run(Harness(scores_single=[-4.7, -6.0]), "PostgreSQL MVCC concurrency control")
-assert h.multi_calls == 1, h.multi_calls
-assert h.expansion_requests == 1, h.expansion_requests
-assert h.single_pass_calls == 1, "original pool not re-searched as a phrasing"
-assert h.phrasings[0] == "PostgreSQL MVCC concurrency control", h.phrasings
-assert len(h.phrasings) == 3, h.phrasings
-assert out == "No relevant documents found in the knowledge base.", out
-print("2. Weak score (-4.7) -> expands once, then reports honestly: OK")
+assert h.expansion_requests == 0, h.expansion_requests
+assert len(h.phrasings) == 1, f"weak-but-nonempty pool must not expand: {h.phrasings}"
+assert "LOW CONFIDENCE" in out, out
+assert "-4.70" in out, f"the score itself must reach the model: {out}"
+assert "chunk A" in out, out
+print("2. Weak score (-4.7) -> no request spent, best match returned flagged: OK")
 
 # -----------------------------
-# 3. Empty candidate pool still expands
+# 3. Empty candidate pool is the one trigger
 # -----------------------------
-h, out = run(Harness(pool=[], scores_single=[]), "quantum tunnelling in semiconductors")
-assert h.multi_calls == 1, h.multi_calls
+h, out = run(Harness(pool=[], expanded_pool=[], scores_single=[], scores_multi=[]),
+             "quantum tunnelling in semiconductors")
+assert h.expansion_requests == 1, h.expansion_requests
+assert len(h.phrasings) == 2, h.phrasings
+assert h.phrasings[0] == ["quantum tunnelling in semiconductors"], h.phrasings
+assert len(h.phrasings[1]) == 3, "expansion contributes its own phrasings"
 assert out == "No relevant documents found in the knowledge base.", out
-print("3. Empty candidate pool -> expands: OK")
+print("3. Empty candidate pool -> expands exactly once: OK")
 
 # -----------------------------
 # 4. Score exactly at the bar counts as found
 # -----------------------------
 h, out = run(Harness(scores_single=[1.0]), "langchain text splitters")
-assert h.multi_calls == 0, h.multi_calls
+assert h.expansion_requests == 0, h.expansion_requests
 assert "chunk A" in out, out
 print("4. Score == DEFAULT_MIN_SCORE is relevant, no expansion: OK")
 
 # -----------------------------
 # 5. Expansion recovers the answer
 # -----------------------------
-h, out = run(Harness(scores_single=[-3.0], scores_multi=[7.4, 5.1, 2.0]),
+h, out = run(Harness(pool=[], scores_single=[], scores_multi=[7.4, 5.1, 2.0]),
              "what is retrieval augmented generation")
-assert h.multi_calls == 1, h.multi_calls
 assert h.expansion_requests == 1, h.expansion_requests
-assert "chunk A" in out, out
+assert "chunk C" in out, out
 print("5. Expanded pool surfaces the answer, one request total: OK")
 
 # -----------------------------
@@ -172,15 +186,28 @@ assert _only_from_files(docs, ["nope.pdf"]) == []
 print("6. _only_from_files keeps only the requested sources: OK")
 
 # -----------------------------
-# 7. Attachments requested, none matched -> names the files
+# 7. Filenames reach the retrievers as a scope, not just a post-filter
+# -----------------------------
+h, out = run(Harness(pool=[D("a", "wanted.pdf")], scores_single=[4.0]),
+             "anything", filenames=["wanted.pdf", "also.pdf"])
+assert h.scopes == [["also.pdf", "wanted.pdf"]], h.scopes
+assert h.expansion_requests == 0, h.expansion_requests
+assert out == "[Document 1 - wanted.pdf]\na", out
+print("7. Attached files are pushed down into retrieval as a scope: OK")
+
+# -----------------------------
+# 8. Attachments requested, nothing in them at all -> names the files,
+#    and the empty scope is what paid for the one expansion request.
 # -----------------------------
 h, out = run(Harness(pool=[D("a", "other.pdf")], scores_single=[0.3]),
              "anything", filenames=["wanted.pdf"])
 assert "wanted.pdf" in out, out
-print("7. Attached files with no matching chunk -> names them: OK")
+assert h.expansion_requests == 1, "an empty scope is exactly when rewording helps"
+assert h.scopes == [["wanted.pdf"], ["wanted.pdf"]], h.scopes
+print("8. Attached files with no matching chunk -> names them: OK")
 
 # -----------------------------
-# 8. Same gate against the real corpus (real Chroma + real cross-encoder)
+# 9. Same gate against the real corpus (real Chroma + real cross-encoder)
 #    Only invoke_model is stubbed, so this still costs zero API requests.
 # -----------------------------
 from embeddings import LocalEmbeddings
@@ -202,19 +229,22 @@ store = Chroma(
     embedding_function=LocalEmbeddings(),
     persist_directory=str(Path(__file__).resolve().parent.parent / "chroma_db"),
 )
-print(f"\n8. Real corpus ({store._collection.count()} chunks):")
+print(f"\n9. Real corpus ({store._collection.count()} chunks):")
 try:
-    for label, q in [
-        ("covered", "text splitting chunk size strategy"),
-        ("not covered", "PostgreSQL MVCC concurrency control"),
+    for label, q, files in [
+        ("covered", "text splitting chunk size strategy", None),
+        ("not covered", "PostgreSQL MVCC concurrency control", None),
+        ("scoped to a file", "programming language", ["Arsh_GenAI.pdf"]),
+        ("scoped, wrong file", "programming language", ["does_not_exist.pdf"]),
     ]:
         seen.clear()
-        out = run_search(q)
+        out = run_search(q, files)
         print(
-            f"   {label:<12} expansion requests={len(seen)} "
-            f"found={'yes' if 'Document' in out else 'no'}"
+            f"   {label:<18} expansion requests={len(seen)} "
+            f"found={'yes' if 'Document' in out else 'no'} "
+            f"lowconf={'LOW CONFIDENCE' in out}"
         )
 finally:
     agent_graph.invoke_model = real_invoke
 
-print("\nPASS: expansion is gated on retrieval quality")
+print("\nPASS: expansion is gated on an empty candidate pool")

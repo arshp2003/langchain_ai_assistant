@@ -48,6 +48,11 @@ TOOL_POLICIES: dict[str, dict[str, Any]] = {
         "auto_approve": True,
         "description": "Divide two numbers",
     },
+    "get_weather": {
+        "priority": "low",
+        "auto_approve": True,
+        "description": "Fetch current weather for a city from OpenWeather",
+    },
     
     # Medium risk - operations that could have moderate impact
     "extract_memory": {

@@ -156,7 +156,7 @@ A 5-step retrieval pipeline that transforms raw vector search results into high-
 ### 8. Human-in-the-Loop (HITL)
 
 - **Tool Approval**: High-risk tools (delete operations) require human approval before execution
-- **Auto-Approval**: Low-risk tools (search, list, download) execute automatically
+- **Auto-Approval**: Low-risk tools (search, list, download, weather lookup) execute automatically
 - **Memory Approval**: Memory extraction is auto-approved but can be reviewed
 - **Rejection Handling**: Rejected actions inject feedback for the agent to adjust
 
@@ -296,6 +296,9 @@ If a run fails mid-execution:
    OPENROUTER_API_KEY=sk-or-v1-your-key-here
    POSTGRES_URI=postgresql://user:password@localhost:5432/dbname?sslmode=disable
    OPENROUTER_MODEL=nvidia/nemotron-3.5-super-vl:free  # optional
+   OPENWEATHER_API_KEY=your-key-here                # optional, for get_weather
+   CHUNK_SIZE=500                                     # optional
+   CHUNK_OVERLAP=100                                  # optional
    ```
 
 4. **Initialize database**:
@@ -327,15 +330,21 @@ Send a question and get a response.
 ```json
 {
   "question": "What is (25 * 10) + 17, and what is that divided by 3?",
-  "user_id": "user-123"
+  "user_id": "user-123",
+  "thread_id": null
 }
 ```
+
+Send `thread_id` back from the previous response to make this question another
+turn in the same conversation. Leave it `null` (or omit it) to start a new
+thread with no history.
 
 **Response**:
 ```json
 {
   "question": "What is (25 * 10) + 17, and what is that divided by 3?",
   "answer": "The result is 89.",
+  "thread_id": "run-9e7a8ecc68584376b0f97e9572f31bc8",
   "trace": [
     {
       "node": "agent",
@@ -766,8 +775,13 @@ result = run_agent_with_recovery(
 - **OPENROUTER_API_KEY**: Your OpenRouter API key (required)
 - **POSTGRES_URI**: PostgreSQL connection string (required)
 - **OPENROUTER_MODEL**: Model to use (optional, default: `nvidia/nemotron-3.5-super-vl:free`)
+- **OPENWEATHER_API_KEY**: Free key from openweathermap.org, used by the `get_weather` tool (optional: without it the tool explains that weather lookup is not configured)
+- **CHUNK_SIZE**: Characters per document chunk at ingestion (optional, default: `500`)
+- **CHUNK_OVERLAP**: Characters repeated between consecutive chunks (optional, default: `100`, must be between `0` and `CHUNK_SIZE`)
 
 ### Code Configuration
+
+Chunking is the only setting routed through `settings.py` (`CHUNK_SIZE`, `CHUNK_OVERLAP`), which the upload endpoint reads so no ingestion path can drift from another. The model slug, the weather key and the database URI are each read in the module that uses them. Everything else below is set in code:
 
 In `agent_graph.py`:
 

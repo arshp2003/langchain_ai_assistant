@@ -1,5 +1,6 @@
 import os
 import random
+import re
 import threading
 import time
 import uuid
@@ -10,13 +11,13 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_openrouter import ChatOpenRouter
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode
+from langgraph.prebuilt import InjectedState, ToolNode
 from openrouter.errors import (
     BadGatewayResponseError,
     EdgeNetworkTimeoutResponseError,
@@ -29,19 +30,26 @@ from openrouter.errors import (
     TooManyRequestsResponseError,
 )
 from psycopg_pool import ConnectionPool
+import requests
 
 from memory import (
     format_memories_for_prompt,
+    get_user_memories,
     init_memory_tables,
     register_thread,
     save_memory,
     semantic_search,
+    touch_memories,
 )
 from tool_policies import should_require_approval, get_pending_tool_calls_requiring_approval
 
 
 # Configurable via .env (OPENROUTER_MODEL) so you can swap slugs without editing code.
 MODEL_NAME = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3.5-super-vl:free")
+
+# Read from .env as OPENWEATHER_API_KEY. Leave it unset and get_weather returns a
+# message telling the user to set it, instead of failing at import time.
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 
 MAX_ATTEMPTS = 2
 
@@ -75,12 +83,59 @@ def _only_from_files(docs: list, filenames: list[str] | None) -> list:
     return [d for d in docs if d.metadata.get("source") in filenames]
 
 
+SELF_REFERENCE = re.compile(r"\b(?:my|mine|our|ours|myself|i)\b", re.IGNORECASE)
+
+
+def resolve_self_reference(user_id: str | None, query: str) -> str | None:
+    """Rewrite "my ..." into "<name> ..." using long-term memory.
+
+    The cross-encoder judges answer-presence, so "my programming language"
+    scored -3.72 on the resume chunk that lists Python and SQL while "Arsh
+    programming language" scored +1.74 on that same chunk. Retrieval never
+    consults memory, so the one word that makes the question answerable is
+    missing from the string the reranker reads.
+
+    Returns None when there is nothing to resolve, leaving the caller on the
+    original query.
+    """
+    if not user_id or not SELF_REFERENCE.search(query):
+        return None
+
+    try:
+        names = [
+            m["value"].strip()
+            for m in get_user_memories(user_id)
+            if m["category"] == "personal" and m["key"] == "name" and m["value"].strip()
+        ]
+    except Exception as exc:
+        print(f"[memory] self-reference resolution skipped: {exc}")
+        return None
+
+    if not names:
+        return None
+
+    # Drop the possessive words, then lead with the name. Adding more identity
+    # words was measured to cut both ways - "Arsh Python developer" scored
+    # +6.18 but "Arsh resume programming language" scored -1.46 - so the rewrite
+    # carries the name and nothing else.
+    remainder = re.sub(r"\s+", " ", SELF_REFERENCE.sub(" ", query)).strip()
+    return f"{names[0]} {remainder}".strip()
+
+
 @tool
-def search_documents(query: str, filenames: list[str] = None) -> str:
+def search_documents(
+    query: str,
+    filenames: list[str] = None,
+    state: Annotated[dict, InjectedState] = None,
+) -> str:
     """Search through uploaded documents to find relevant information.
     
     Use this tool when the user asks about content from their uploaded documents,
     notes, PDFs, or any knowledge base content. Returns relevant document chunks.
+    
+    Write the query so it stands alone: the search cannot see this conversation,
+    so replace "my" or "the user" with the actual name or role from the memory
+    context when you have it.
     
     Args:
         query: The search query to find relevant document sections
@@ -88,7 +143,8 @@ def search_documents(query: str, filenames: list[str] = None) -> str:
                    only searches within these files. If None, searches all documents.
         
     Returns:
-        Relevant document chunks or a message if no documents are found
+        Relevant document chunks, a LOW CONFIDENCE closest match, or a message
+        if nothing was found
     """
     try:
         from langchain_chroma import Chroma
@@ -104,46 +160,75 @@ def search_documents(query: str, filenames: list[str] = None) -> str:
         
         from reranker import rerank, filter_relevant, DEFAULT_MIN_SCORE
         from query_transform import expand_queries
-        from hybrid_search import hybrid_search, multi_query_search
+        from hybrid_search import multi_query_search
         from trimmer import trim_passages
         from compressor import compress_context
         from validator import validate_compression
 
-        # First pass searches the query exactly as written, so a normal search
-        # costs no extra model request.
-        docs = _only_from_files(hybrid_search(vector_store, query), filenames)
-        scored_docs = rerank(query, docs, top_k=3)
+        user_id = (state or {}).get("user_id") or ""
 
-        # Conditional multi-query expansion. Both retrievers are fed the same
-        # string, so one unlucky phrasing fails them together and rephrasings
-        # rarely miss the same way - but generating them costs a request against
-        # a 50/day cap, and on this corpus they only ever helped when the plain
-        # search came up dry. So expand only when nothing clears the relevance
-        # bar, reusing reranker's threshold instead of tuning a second one.
-        if not scored_docs or scored_docs[0][1] < DEFAULT_MIN_SCORE:
+        # Resolving "my" costs a second local retrieval pass and no model
+        # request, so both wordings feed the candidate pool.
+        resolved = resolve_self_reference(user_id, query)
+        search_query = resolved or query
+        queries = [query, resolved] if resolved else [query]
+
+        # The filenames go into the retrievers as a metadata filter, and the
+        # helper below re-checks the merged pool, so a search scoped to one
+        # attached file can never hand the model a chunk from another one.
+        docs = _only_from_files(
+            multi_query_search(vector_store, queries, sources=filenames), filenames
+        )
+
+        # Conditional multi-query expansion. Generating the phrasings costs a
+        # request against a 50/day cap. Vector search always fills k, so an
+        # empty pool means the scope itself holds nothing - the case of a
+        # question aimed at attached files that use different vocabulary than
+        # the wording, which rephrasing genuinely can repair. A pool full of
+        # weak matches is a ranking problem, and every phrasing would go back
+        # through the same two retrievers that just ranked them.
+        if not docs:
             docs = _only_from_files(
-                multi_query_search(vector_store, expand_queries(query)), filenames
+                multi_query_search(
+                    vector_store, expand_queries(search_query), sources=filenames
+                ),
+                filenames,
             )
-            scored_docs = rerank(query, docs, top_k=3)
 
         if not docs:
             if filenames:
                 return f"No relevant content found in the attached files: {', '.join(filenames)}"
             return "No relevant documents found in the knowledge base."
 
-        scored_docs = filter_relevant(scored_docs)
+        scored_docs = rerank(search_query, docs, top_k=3)
 
-        if not scored_docs:
-            return "No relevant documents found in the knowledge base."
+        relevant = filter_relevant(scored_docs)
+
+        if not relevant:
+            # Nothing cleared the bar. Returning nothing here is what made a
+            # correct chunk invisible - the model only ever saw "no documents
+            # found" and passed that on. Hand back the best candidate with its
+            # score so the model judges relevance instead of the pipeline
+            # deciding alone, and skip trimming and compression so the evidence
+            # reaches it intact.
+            best_doc, best_score = max(scored_docs, key=lambda pair: pair[1])
+            source = best_doc.metadata.get("source", "Unknown")
+            return (
+                f"LOW CONFIDENCE: nothing cleared the relevance bar (best score "
+                f"{best_score:.2f}, {DEFAULT_MIN_SCORE} needed). This is the "
+                f"closest match, not a confirmed answer. Use it only if it "
+                f"genuinely answers the question; otherwise say the documents do "
+                f"not cover it.\n\n[{source}]\n{best_doc.page_content}"
+            )
         
         # Trim each kept chunk to only its query-relevant sentences
-        trimmed_docs = trim_passages(query, scored_docs)
+        trimmed_docs = trim_passages(search_query, relevant)
         
         # Compress the trimmed context further if it's still long
-        compressed_docs = compress_context(query, trimmed_docs)
+        compressed_docs = compress_context(search_query, trimmed_docs)
         
         # Validate that compression didn't lose answer-relevant information
-        scored_docs = validate_compression(query, trimmed_docs, compressed_docs)
+        scored_docs = validate_compression(search_query, trimmed_docs, compressed_docs)
         
         result = []
         for i, (doc, score) in enumerate(scored_docs, 1):
@@ -253,8 +338,14 @@ def restore_memory(memory_id: str, user_id: str) -> str:
 
 @tool
 def list_documents() -> str:
-    """List all uploaded documents.
-    
+    """List the names of all uploaded documents.
+
+    Use this only when the user asks which files they have uploaded, or before
+    deleting or downloading a named file. Do NOT call it to decide which
+    document to search: search_documents already covers every uploaded file
+    when no filenames are given, so a content question should go straight to
+    search_documents.
+
     Returns:
         A formatted list of documents with their names and types
     """
@@ -324,6 +415,89 @@ def list_memories(user_id: str) -> str:
     return "\n".join(lines)
 
 
+@tool
+def get_weather(city: str) -> str:
+    """Get the current weather for a city.
+
+    Use this for any question about real-world weather: temperature, rain, wind,
+    or whether to bring a jacket. It reads nothing from the user's documents or
+    memories, so call it directly instead of searching first.
+
+    Args:
+        city: City name. Add a country code when the name is shared by several
+            places, e.g. "Paris" or "Paris,US".
+
+    Returns:
+        Current conditions for the place OpenWeather matched, or an explanation
+        of why no weather could be fetched.
+    """
+    if not OPENWEATHER_API_KEY:
+        return (
+            "Weather lookup is not configured. Ask the user to set "
+            "OPENWEATHER_API_KEY in the project's .env file and restart the server."
+        )
+
+    city = city.strip()
+    if not city:
+        return "No city was given. Ask the user which place they want the weather for."
+
+    try:
+        response = requests.get(
+            "https://api.openweathermap.org/data/2.5/weather",
+            params={"q": city, "units": "metric", "lang": "en", "appid": OPENWEATHER_API_KEY},
+            timeout=10,
+        )
+    except requests.exceptions.RequestException as exc:
+        return f"Could not reach OpenWeather: {exc}"
+
+    if response.status_code == 401:
+        return (
+            "OpenWeather rejected the API key (401). A brand-new key can take a "
+            "few hours to activate, so the key is probably correct but not live yet."
+        )
+    if response.status_code == 404:
+        return (
+            f"OpenWeather has no city named {city!r}. Check the spelling, or add a "
+            "country code such as \"Berlin,DE\"."
+        )
+    if response.status_code == 429:
+        return "OpenWeather rate limit reached (429). Try again in a minute."
+    if response.status_code != 200:
+        return f"OpenWeather returned HTTP {response.status_code}: {response.text[:200]}"
+
+    data = response.json()
+    main = data["main"]
+    wind = data["wind"]
+    country = data["sys"].get("country", "")
+    place = f"{data['name']}, {country}" if country else data["name"]
+    sky = ", ".join(w["description"] for w in data["weather"])
+
+    # OpenWeather returns every timestamp as UTC seconds; the timezone offset in
+    # the response is what turns them into the clock read in that city.
+    def local_clock(seconds):
+        return time.strftime("%H:%M", time.gmtime(seconds + data["timezone"]))
+
+    return "\n".join(
+        [
+            f"Weather in {place} as of {local_clock(data['dt'])} local time",
+            (
+                f"{sky.capitalize()}; {main['temp']:.1f}°C, feels like "
+                f"{main['feels_like']:.1f}°C (today {main['temp_min']:.1f} to "
+                f"{main['temp_max']:.1f}°C)"
+            ),
+            (
+                f"Humidity {main['humidity']}%, pressure {main['pressure']} hPa, "
+                f"cloud cover {data['clouds']['all']}%"
+            ),
+            f"Wind {wind.get('speed', 0)} m/s from {wind.get('deg', 0)} degrees",
+            (
+                f"Sunrise {local_clock(data['sys']['sunrise'])}, "
+                f"sunset {local_clock(data['sys']['sunset'])} local time"
+            ),
+        ]
+    )
+
+
 tools = [
     add_numbers,
     multiply_numbers,
@@ -335,6 +509,7 @@ tools = [
     delete_document,
     delete_memory,
     restore_memory,
+    get_weather,
 ]
 
 
@@ -483,6 +658,27 @@ def _stats_delta(before: dict) -> dict:
     }
 
 
+def load_memories_for_prompt(user_id: str, question: str) -> str:
+    """Return the memory block to inject for this question, and record the use.
+
+    Only the rows that actually reach the prompt are stamped as accessed. The
+    store used to stamp every row on every listing instead, which made
+    last_accessed identical across the board and useless for finding stale
+    memories.
+    """
+    if not user_id:
+        return ""
+
+    try:
+        memories = semantic_search(user_id, question, top_k=3)
+    except Exception as exc:
+        print(f"[memory] failed to search memories: {exc}")
+        return ""
+
+    touch_memories(user_id, [m["memory_id"] for m in memories])
+    return format_memories_for_prompt(memories)
+
+
 def extract_memories_from_conversation(messages: list[BaseMessage]) -> list[dict]:
     """Use LLM to extract personal info and preferences from conversation."""
     conversation_text = "\n".join(
@@ -513,6 +709,22 @@ Only extract information that is:
 1. About the user (not general knowledge)
 2. Likely to be useful in future conversations
 3. Not already obvious from the current conversation
+
+Never extract:
+- Which files are uploaded, attached or deleted. That is system state the
+  backend can read from disk; a stored copy goes stale silently and then
+  misleads retrieval.
+- What the user is asking right now (keys like "active_query", "current_task").
+  A question is not a permanent fact about the person.
+- Anything about the assistant's own pipeline, tools or approval steps.
+- Test or placeholder values the user is clearly trying out.
+
+Reuse the canonical category.key names below when a fact applies, instead of
+inventing a synonym. Reusing the name updates the existing row; inventing a
+second name creates two memories that can disagree:
+- personal.name, personal.age, personal.location
+- preference.primary_language, preference.interest
+- context.role, context.employer, context.experience_years
 
 Return ONLY the JSON array, no other text."""
 
@@ -545,6 +757,31 @@ Return ONLY the JSON array, no other text."""
     return []
 
 
+# Keys that proved harmful in this store: claims about current file state, and
+# claims about what is happening in this conversation (what the user asked,
+# which step they approved). Both go stale without telling the memory layer,
+# and a stale one redirects retrieval to the wrong file. The extraction prompt
+# asks the model not to produce these; this set is the guarantee, because a
+# prompt is a request and a filter is a fact.
+BLOCKED_MEMORY_KEYS = {
+    "uploaded_files",
+    "uploaded_document",
+    "attached_document",
+    "attached_document_scope",
+    "deleted_pdfs",
+    "resume_uploaded",
+    "resume_status",
+    "resume_file",
+    "saved_document",
+    "extract_memory_rejection",
+    "active_query",
+    "current_task",
+    "user_id",
+    "default_user_id",
+    "desired_user_id",
+}
+
+
 def save_extracted_memories(user_id: str, memories: list[dict]) -> int:
     """Save extracted memories to database, returns count of memories saved."""
     if not user_id or not memories:
@@ -552,6 +789,10 @@ def save_extracted_memories(user_id: str, memories: list[dict]) -> int:
 
     count = 0
     for mem in memories:
+        if mem["key"] in BLOCKED_MEMORY_KEYS:
+            print(f"[memory] blocked derived-state key: {mem['key']}")
+            continue
+
         try:
             save_memory(
                 user_id=user_id,
@@ -594,8 +835,34 @@ def invoke_model(runnable, messages):
 # 5. Define nodes
 # -----------------------------
 
+# The model sees ten tool schemas and no guidance, so it used to "check" which
+# file to search by listing documents first - one extra round trip, and the
+# reply that came back was a question about files instead of an answer.
+# search_documents with no filenames already covers the whole corpus, so that
+# check is never needed. Sent per call and never stored in the thread.
+SYSTEM_PROMPT = """You answer questions about the user's uploaded documents, and you can do
+arithmetic and look up current weather.
+
+Document rules:
+- When asked about document content, call search_documents right away. Leave
+  filenames out unless the user attached specific files: with no filenames it
+  searches every uploaded document, so you never need to know which one holds
+  the answer.
+- Never call list_documents to decide what to search or to answer a content
+  question. Call it only when the user asks which files they have uploaded.
+- Treat the most recent "Attached documents:" line as the current scope.
+  Earlier ones belong to previous turns.
+- A question about real-world weather is not a document question: call
+  get_weather with the city and answer from what it returns. If it says the
+  lookup is not configured, pass that on instead of searching documents.
+- Say only what the retrieved chunks support. If they do not answer the
+  question, say so instead of guessing.
+"""
+
+
 def agent_node(state: AgentState) -> dict:
-    response = invoke_model(model_with_tools, state["messages"])
+    messages = [SystemMessage(content=SYSTEM_PROMPT), *state["messages"]]
+    response = invoke_model(model_with_tools, messages)
     return {"messages": [response]}
 
 
@@ -1013,13 +1280,7 @@ def _events_from(stream):
 
 def stream_agent(question: str, thread_id: str | None = None, user_id: str | None = None):
     """Run a fresh question, saving every step to the thread's checkpoint."""
-    user_memories = ""
-    if user_id:
-        try:
-            memories = semantic_search(user_id, question, top_k=3)
-            user_memories = format_memories_for_prompt(memories)
-        except Exception as exc:
-            print(f"[memory] failed to search memories: {exc}")
+    user_memories = load_memories_for_prompt(user_id, question)
 
     messages = [HumanMessage(content=question)]
     if user_memories:
@@ -1066,13 +1327,7 @@ def run_agent(question: str, thread_id: str | None = None, user_id: str | None =
     config = _thread_config(thread_id)
     resolved_thread_id = config["configurable"]["thread_id"]
 
-    user_memories = ""
-    if user_id:
-        try:
-            memories = semantic_search(user_id, question, top_k=3)
-            user_memories = format_memories_for_prompt(memories)
-        except Exception as exc:
-            print(f"[memory] failed to search memories: {exc}")
+    user_memories = load_memories_for_prompt(user_id, question)
 
     attached_info = ""
     if attached_documents:
@@ -1144,13 +1399,7 @@ def run_agent_with_recovery(
             if item["event"] == "answer":
                 answer = item["content"]
 
-    user_memories = ""
-    if user_id:
-        try:
-            memories = semantic_search(user_id, question, top_k=3)
-            user_memories = format_memories_for_prompt(memories)
-        except Exception as exc:
-            print(f"[memory] failed to search memories: {exc}")
+    user_memories = load_memories_for_prompt(user_id, question)
 
     messages = [HumanMessage(content=question)]
     if user_memories:
@@ -1211,13 +1460,7 @@ def run_agent_hitl(
     config = _thread_config(thread_id)
     resolved_thread_id = config["configurable"]["thread_id"]
 
-    user_memories = ""
-    if user_id:
-        try:
-            memories = semantic_search(user_id, question, top_k=3)
-            user_memories = format_memories_for_prompt(memories)
-        except Exception as exc:
-            print(f"[memory] failed to search memories: {exc}")
+    user_memories = load_memories_for_prompt(user_id, question)
 
     attached_info = ""
     if attached_documents:

@@ -45,73 +45,159 @@ def get_memory_pool() -> ConnectionPool:
     return _memory_pool
 
 
+# -----------------------------
+# Schema history (migrations)
+# -----------------------------
+#
+# One entry per change to these tables, in the order the change was introduced,
+# and the position in the list IS the version number. A database records the
+# versions it has reached in `schema_migrations`, so a change runs once per
+# database instead of being re-attempted on every boot, and "which schema is
+# this database on?" becomes a question you can answer with a query.
+#
+# Append only. Never edit or reorder an existing entry: a database that already
+# recorded version 4 would then be holding a different statement under that
+# number, and nothing would notice.
+#
+# The second item of each pair asks "is this change already true of this
+# database?". It is consulted only while the ledger is still empty, which is how
+# a database built by the old re-run-everything code adopts the schema it already
+# has instead of being migrated blind - while a database genuinely missing one
+# change still gets exactly that one.
+#
+# A probe must return zero rows when the change is absent. `SELECT <expr> IS
+# NOT NULL` always returns one row, and a row holding false is still a row, so
+# it would report an absent table as present and skip the CREATE that defines it.
+MIGRATIONS = [
+    (
+        "CREATE EXTENSION IF NOT EXISTS vector",
+        "SELECT 1 FROM pg_extension WHERE extname = 'vector'",
+    ),
+    (
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            name TEXT,
+            email TEXT,
+            preferences JSONB DEFAULT '{}',
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """,
+        "SELECT 1 WHERE to_regclass('public.users') IS NOT NULL",
+    ),
+    (
+        """
+        CREATE TABLE IF NOT EXISTS memories (
+            memory_id UUID PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+            category TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            importance FLOAT DEFAULT 0.5,
+            embedding vector(384),
+            deleted BOOLEAN DEFAULT FALSE,
+            deleted_at TIMESTAMPTZ,
+            last_accessed TIMESTAMPTZ DEFAULT NOW(),
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            UNIQUE(user_id, category, key)
+        )
+        """,
+        "SELECT 1 WHERE to_regclass('public.memories') IS NOT NULL",
+    ),
+    (
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding vector(384)",
+        """SELECT 1 FROM information_schema.columns
+           WHERE table_schema = 'public' AND table_name = 'memories'
+             AND column_name = 'embedding'""",
+    ),
+    (
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS deleted BOOLEAN DEFAULT FALSE",
+        """SELECT 1 FROM information_schema.columns
+           WHERE table_schema = 'public' AND table_name = 'memories'
+             AND column_name = 'deleted'""",
+    ),
+    (
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ",
+        """SELECT 1 FROM information_schema.columns
+           WHERE table_schema = 'public' AND table_name = 'memories'
+             AND column_name = 'deleted_at'""",
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_memories_user_id ON memories(user_id)",
+        "SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'idx_memories_user_id'",
+    ),
+    (
+        """
+        CREATE TABLE IF NOT EXISTS user_threads (
+            user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+            thread_id TEXT NOT NULL,
+            title TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            last_active TIMESTAMPTZ DEFAULT NOW(),
+            PRIMARY KEY (user_id, thread_id)
+        )
+        """,
+        "SELECT 1 WHERE to_regclass('public.user_threads') IS NOT NULL",
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_user_threads_user_id ON user_threads(user_id)",
+        "SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'idx_user_threads_user_id'",
+    ),
+]
+
+# A fixed name in Postgres's cluster-wide advisory-lock space, so two processes
+# booting at the same moment cannot both migrate. The number is arbitrary; it
+# only has to stay the same.
+_MIGRATION_LOCK_ID = 728391
+
+
 def init_memory_tables() -> None:
+    """Bring this database's schema up to the last entry in MIGRATIONS."""
     pool = get_memory_pool()
     with pool.connection() as conn:
-        conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id TEXT PRIMARY KEY,
-                name TEXT,
-                email TEXT,
-                preferences JSONB DEFAULT '{}',
-                created_at TIMESTAMPTZ DEFAULT NOW(),
-                updated_at TIMESTAMPTZ DEFAULT NOW()
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS memories (
-                memory_id UUID PRIMARY KEY,
-                user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-                category TEXT NOT NULL,
-                key TEXT NOT NULL,
-                value TEXT NOT NULL,
-                importance FLOAT DEFAULT 0.5,
-                embedding vector(384),
-                deleted BOOLEAN DEFAULT FALSE,
-                deleted_at TIMESTAMPTZ,
-                last_accessed TIMESTAMPTZ DEFAULT NOW(),
-                created_at TIMESTAMPTZ DEFAULT NOW(),
-                UNIQUE(user_id, category, key)
-            )
-        """)
-        conn.execute("""
-            ALTER TABLE memories
-            ADD COLUMN IF NOT EXISTS embedding vector(384)
-        """)
-        conn.execute("""
-            ALTER TABLE memories
-            ADD COLUMN IF NOT EXISTS deleted BOOLEAN DEFAULT FALSE
-        """)
-        conn.execute("""
-            ALTER TABLE memories
-            ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ
-        """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_memories_user_id
-            ON memories(user_id)
-        """)
+        conn.execute("SELECT pg_advisory_lock(%s)", (_MIGRATION_LOCK_ID,))
         try:
             conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_memories_embedding
-                ON memories USING hnsw (embedding vector_cosine_ops)
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    v INTEGER PRIMARY KEY
+                )
             """)
-        except Exception as exc:
-            print(f"[memory] vector index creation skipped: {exc}")
+            applied = {
+                row[0]
+                for row in conn.execute("SELECT v FROM schema_migrations").fetchall()
+            }
+            adopt_existing = not applied
+
+            for version, (sql, probe) in enumerate(MIGRATIONS):
+                if version in applied:
+                    continue
+                if adopt_existing and conn.execute(probe).fetchone():
+                    print(f"[memory] migration {version} already present, adopting")
+                else:
+                    conn.execute(sql)
+                    print(f"[memory] migration {version} applied")
+                conn.execute(
+                    "INSERT INTO schema_migrations (v) VALUES (%s)", (version,)
+                )
+
+            _ensure_vector_index(conn)
+        finally:
+            conn.execute("SELECT pg_advisory_unlock(%s)", (_MIGRATION_LOCK_ID,))
+
+
+def _ensure_vector_index(conn) -> None:
+    """Best-effort HNSW index. Deliberately not a numbered migration: this is an
+    optimisation, so a failure must neither block boot nor be recorded as
+    applied. Recording something that did not happen is worse than recording
+    nothing."""
+    try:
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS user_threads (
-                user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-                thread_id TEXT NOT NULL,
-                title TEXT,
-                created_at TIMESTAMPTZ DEFAULT NOW(),
-                last_active TIMESTAMPTZ DEFAULT NOW(),
-                PRIMARY KEY (user_id, thread_id)
-            )
+            CREATE INDEX IF NOT EXISTS idx_memories_embedding
+            ON memories USING hnsw (embedding vector_cosine_ops)
         """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_user_threads_user_id
-            ON user_threads(user_id)
-        """)
+    except Exception as exc:
+        print(f"[memory] vector index creation skipped: {exc}")
 
 
 def ensure_user(user_id: str, name: Optional[str] = None, email: Optional[str] = None) -> None:
@@ -136,19 +222,30 @@ def save_memory(user_id: str, category: str, key: str, value: str, importance: f
     pool = get_memory_pool()
     with pool.connection() as conn:
         register_vector(conn)
-        conn.execute("""
+        # RETURNING, not the minted uuid: on a conflict the row keeps its
+        # original memory_id, so returning the new one hands callers an id that
+        # exists nowhere - and their next delete by that id silently no-ops.
+        stored_id = conn.execute("""
             INSERT INTO memories (memory_id, user_id, category, key, value, importance, embedding)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (user_id, category, key) DO UPDATE
             SET value = EXCLUDED.value,
                 importance = EXCLUDED.importance,
                 embedding = EXCLUDED.embedding,
+                deleted = FALSE,
+                deleted_at = NULL,
                 last_accessed = NOW()
-        """, (memory_id, user_id, category, key, value, importance, embedding))
-    return memory_id
+            RETURNING memory_id
+        """, (memory_id, user_id, category, key, value, importance, embedding)).fetchone()[0]
+    return str(stored_id)
 
 
 def get_user_memories(user_id: str) -> list[dict]:
+    """Every live memory for a user, highest importance first.
+
+    Does not touch last_accessed - listing is not the same as using. See
+    touch_memories(), which the prompt path calls for the rows it injects.
+    """
     pool = get_memory_pool()
     with pool.connection() as conn:
         rows = conn.execute("""
@@ -157,12 +254,6 @@ def get_user_memories(user_id: str) -> list[dict]:
             WHERE user_id = %s AND (deleted = FALSE OR deleted IS NULL)
             ORDER BY importance DESC, last_accessed DESC
         """, (user_id,)).fetchall()
-
-        with pool.connection() as update_conn:
-            update_conn.execute("""
-                UPDATE memories SET last_accessed = NOW()
-                WHERE user_id = %s AND (deleted = FALSE OR deleted IS NULL)
-            """, (user_id,))
 
     return [
         {
@@ -176,6 +267,25 @@ def get_user_memories(user_id: str) -> list[dict]:
         }
         for row in rows
     ]
+
+
+def touch_memories(user_id: str, memory_ids: list[str]) -> int:
+    """Mark the memories that were actually used as recently accessed.
+
+    Called with the ids that went into a prompt, not with everything the user
+    owns. Stamping every row on every read makes last_accessed identical across
+    the store, which destroys the only signal for spotting stale memories.
+    """
+    if not memory_ids:
+        return 0
+
+    pool = get_memory_pool()
+    with pool.connection() as conn:
+        result = conn.execute("""
+            UPDATE memories SET last_accessed = NOW()
+            WHERE user_id = %s AND memory_id = ANY(%s::uuid[])
+        """, (user_id, list(memory_ids)))
+        return result.rowcount
 
 
 def search_memories(user_id: str, query: str, limit: int = 10) -> list[dict]:

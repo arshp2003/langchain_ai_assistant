@@ -42,6 +42,9 @@ chromadb==1.5.9
 langchain-chroma==1.1.0
 rank-bm25==0.2.2            # BM25 keyword search in hybrid_search.py
 
+# --- External APIs ---
+requests==2.34.2              # HTTP client for the get_weather tool
+
 # --- API ---
 fastapi==0.142.2
 pydantic==2.12.5

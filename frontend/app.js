@@ -203,7 +203,8 @@ async function startNormalConversation(message, userId) {
         body: JSON.stringify({
             question: message,
             user_id: userId,
-            attached_documents: attachedDocuments.length > 0 ? attachedDocuments : null
+            attached_documents: attachedDocuments.length > 0 ? attachedDocuments : null,
+            thread_id: currentThreadId
         })
     });
 
@@ -223,7 +224,8 @@ async function startHITLConversation(message, userId) {
         body: JSON.stringify({
             question: message,
             user_id: userId,
-            attached_documents: attachedDocuments.length > 0 ? attachedDocuments : null
+            attached_documents: attachedDocuments.length > 0 ? attachedDocuments : null,
+            thread_id: currentThreadId
         })
     });
 
@@ -291,7 +293,8 @@ async function handleApproval(approved) {
         } else {
             hideApprovalPanel();
             isWaitingForApproval = false;
-            currentThreadId = null;
+            // Keep currentThreadId: it is what makes the next question a turn in
+            // this conversation instead of a brand-new thread with no history.
         }
         
     } catch (error) {
@@ -353,6 +356,7 @@ fileInput.addEventListener('change', async () => {
         if (data.status === 'uploaded') {
             // File uploaded successfully - it's now attached and ready to send with next message
             console.log(`File "${file.name}" uploaded and indexed (${data.chunks_created} chunks)`);
+            if (data.message) addMessage(data.message, 'system');
         } else {
             addMessage(`Upload error: ${data.error}`, 'system');
             detachDocument(file.name);

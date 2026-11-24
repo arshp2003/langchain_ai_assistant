@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -28,10 +29,11 @@ from memory import (
     get_user_threads,
     save_memory,
 )
+from settings import CHUNK_OVERLAP, CHUNK_SIZE
 
 
 app = FastAPI(
-    title="Multi Node LangGraph Agent API",
+    title="LangGraph Agent API",
     description="A ReAct agent with answer validation, retry and fallback nodes.",
     version="1.0.0",
 )
@@ -61,6 +63,14 @@ class ChatRequest(BaseModel):
         description="Optional list of filenames to restrict document search to",
         examples=[["report.pdf", "notes.txt"]],
     )
+    thread_id: str | None = Field(
+        default=None,
+        description=(
+            "Conversation id returned by the previous call. Send it back to keep "
+            "the chat's history; leave it out to start a fresh conversation."
+        ),
+        examples=["run-3f2a1c9d"],
+    )
 
 
 class ChatResponse(BaseModel):
@@ -68,6 +78,7 @@ class ChatResponse(BaseModel):
     answer: str
     trace: list[dict]
     llm: dict = Field(default_factory=dict)
+    thread_id: str = ""
 
 
 @app.get("/health")
@@ -81,12 +92,18 @@ def health() -> dict:
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest) -> ChatResponse:
-    result = run_agent(request.question, user_id=request.user_id, attached_documents=request.attached_documents)
+    result = run_agent(
+        request.question,
+        thread_id=request.thread_id,
+        user_id=request.user_id,
+        attached_documents=request.attached_documents,
+    )
     return ChatResponse(
         question=request.question,
         answer=result["answer"],
         trace=result["trace"],
         llm=result["llm"],
+        thread_id=result["thread_id"],
     )
 
 
@@ -106,7 +123,11 @@ def usage_reset() -> dict:
 def chat_stream(request: ChatRequest) -> StreamingResponse:
 
     def event_stream():
-        for item in stream_agent(request.question, user_id=request.user_id):
+        for item in stream_agent(
+            request.question,
+            thread_id=request.thread_id,
+            user_id=request.user_id,
+        ):
             yield f"data: {json.dumps(item)}\n\n"
         yield "data: [DONE]\n\n"
 
@@ -240,7 +261,12 @@ class ApprovalRequest(BaseModel):
 def chat_hitl(request: ChatRequest) -> dict:
     """Start a human-in-the-loop run. Pauses before tool calls and memory
     extraction so the user can review and approve/reject each step."""
-    result = run_agent_hitl(request.question, user_id=request.user_id, attached_documents=request.attached_documents)
+    result = run_agent_hitl(
+        request.question,
+        thread_id=request.thread_id,
+        user_id=request.user_id,
+        attached_documents=request.attached_documents,
+    )
     return result
 
 
@@ -292,8 +318,50 @@ def _load_and_chunk(file_path: Path):
         raise ValueError(f"Unsupported file type: {suffix}. Use .pdf, .txt, or .md")
 
     documents = loader.load()
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+    )
     return splitter.split_documents(documents)
+
+
+ALLOWED_SUFFIXES = (".pdf", ".txt", ".md")
+
+
+def _safe_document_path(raw_filename: str | None) -> Path:
+    """Turn a client-supplied filename into a path that stays inside DOCUMENTS_DIR.
+
+    Filenames arrive straight from the request here, so they can be missing
+    entirely, or hold something like "..\\..\\.env" to reach outside the
+    documents directory.
+    """
+    if not raw_filename:
+        raise ValueError("No filename supplied.")
+
+    name = raw_filename.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    if name in ("", ".", ".."):
+        raise ValueError("Not a usable filename.")
+
+    file_path = (DOCUMENTS_DIR / name).resolve()
+    if file_path.parent != DOCUMENTS_DIR.resolve():
+        raise ValueError("Path is not inside the documents directory.")
+
+    if file_path.suffix.lower() not in ALLOWED_SUFFIXES:
+        raise ValueError(
+            f"Unsupported file type: {file_path.suffix or 'none'}. Use .pdf, .txt, or .md"
+        )
+    return file_path
+
+
+def _indexed_chunk_count(filename: str) -> int:
+    """How many chunks of this file already live in the vector store."""
+    try:
+        raw = _get_vector_store()._collection.get(
+            where={"source": filename}, include=["metadatas"]
+        )
+        return len(raw["ids"])
+    except Exception:
+        return 0
 
 
 @app.post("/documents/upload")
@@ -301,32 +369,66 @@ async def upload_document(file: UploadFile) -> dict:
     """Upload a document (PDF, TXT, or MD), chunk it, and store in the vector database."""
     DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    file_path = DOCUMENTS_DIR / file.filename
+    try:
+        file_path = _safe_document_path(file.filename)
+    except ValueError as exc:
+        return {"status": "error", "filename": file.filename, "error": str(exc)}
+
+    filename = file_path.name
     content = await file.read()
-    file_path.write_bytes(content)
+
+    # add_documents mints new ids on every call, so uploading a file twice appends
+    # a second full copy rather than replacing the first, and those duplicates
+    # then compete with the original during reranking.
+    was_already_on_disk = file_path.exists()
+    indexed = _indexed_chunk_count(filename) if was_already_on_disk else 0
+    unchanged = (
+        indexed > 0
+        and was_already_on_disk
+        and hashlib.sha256(content).hexdigest()
+        == hashlib.sha256(file_path.read_bytes()).hexdigest()
+    )
+
+    if unchanged:
+        return {
+            "status": "uploaded",
+            "already_uploaded": True,
+            "filename": filename,
+            "chunks_created": indexed,
+            "message": f"'{filename}' is already indexed, so there was no need to upload it again. It is ready to search.",
+        }
 
     try:
+        file_path.write_bytes(content)
+
         chunks = _load_and_chunk(file_path)
         vector_store = _get_vector_store()
 
         for chunk in chunks:
-            chunk.metadata["source"] = file.filename
+            chunk.metadata["source"] = filename
+
+        if was_already_on_disk:
+            vector_store._collection.delete(where={"source": filename})
 
         ids = vector_store.add_documents(chunks)
 
         from hybrid_search import invalidate_bm25
         invalidate_bm25()
 
-        return {
+        result = {
             "status": "uploaded",
-            "filename": file.filename,
+            "filename": filename,
             "chunks_created": len(chunks),
             "vectors_stored": len(ids),
         }
+        if was_already_on_disk:
+            result["replaced"] = True
+            result["message"] = f"'{filename}' changed since the last upload, so the old version was replaced."
+        return result
     except Exception as exc:
         return {
             "status": "error",
-            "filename": file.filename,
+            "filename": filename,
             "error": str(exc),
         }
 
@@ -356,7 +458,11 @@ def list_documents() -> dict:
 @app.delete("/documents/{filename}")
 def delete_document(filename: str) -> dict:
     """Delete a document file. Note: vector embeddings remain in ChromaDB."""
-    file_path = DOCUMENTS_DIR / filename
+    try:
+        file_path = _safe_document_path(filename)
+    except ValueError:
+        return {"status": "not_found", "filename": filename}
+
     if not file_path.exists():
         return {"status": "not_found", "filename": filename}
 
@@ -371,13 +477,17 @@ def delete_document(filename: str) -> dict:
 @app.get("/documents/{filename}/download")
 def download_document(filename: str):
     """Download a document file."""
-    file_path = DOCUMENTS_DIR / filename
+    try:
+        file_path = _safe_document_path(filename)
+    except ValueError:
+        return {"status": "not_found", "filename": filename}
+
     if not file_path.exists():
         return {"status": "not_found", "filename": filename}
 
     return FileResponse(
         path=str(file_path),
-        filename=filename,
+        filename=file_path.name,
         media_type="application/octet-stream",
     )
 

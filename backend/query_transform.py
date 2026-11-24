@@ -15,7 +15,9 @@ Ranking is left entirely to the cross-encoder downstream - the variants are not
 scored on a comparable scale and must not be fused by score.
 
 Costs one extra model request, which matters on a free-tier cap, so callers gate
-this on a weak first pass rather than running it on every search (see
+this on an EMPTY candidate pool rather than on a weak first pass: every phrasing
+goes back through the same two retrievers, so rewording can recover chunks the
+first wording never reached but cannot repair a pool it ranked badly (see
 `search_documents` in agent_graph.py). Failures fall back to the original query
 alone so expansion can never block retrieval.
 """
